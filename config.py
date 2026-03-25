@@ -1,0 +1,52 @@
+"""
+config.py — Central configuration for LLM2Swarm.
+All tuneable constants live here; nothing is hardcoded elsewhere.
+"""
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()  # reads .env if present
+
+# ─── Drone fleet ───────────────────────────────────────────────────────────────
+DRONE_IDS: list[str] = ["drone_1", "drone_2", "drone_3"]
+
+# ─── Control loop ──────────────────────────────────────────────────────────────
+CONTROL_LOOP_INTERVAL: float = 10.0   # seconds between perception/replanning ticks
+VLM_TIMEOUT: float           = 30.0   # max seconds to wait for edge VLM response (multimodal ~20s for 9b)
+VLM_FALLBACK_DECISION: str   = "continue"  # used if VLM times out or errors
+
+# ─── Cloud LLM (Global Planner) ───────────────────────────────────────────────
+# To use GPT-4o:   GLOBAL_LLM_BASE_URL="" (or unset),  GLOBAL_LLM_MODEL="gpt-4o"
+# To use Ollama:   GLOBAL_LLM_BASE_URL=http://localhost:11435/v1, GLOBAL_LLM_MODEL=qwen3.5:9b
+OPENAI_API_KEY: str       = os.getenv("OPENAI_API_KEY", "")
+GLOBAL_LLM_BASE_URL: str  = os.getenv("GLOBAL_LLM_BASE_URL", "")   # empty = use OpenAI default
+GLOBAL_LLM_API_KEY: str   = os.getenv("GLOBAL_LLM_API_KEY", "") or OPENAI_API_KEY
+GLOBAL_LLM_MODEL: str     = os.getenv("GLOBAL_LLM_MODEL", "gpt-4o")
+
+# ─── Edge VLM (Local Replanner — Ollama on remote server) ─────────────────────
+# If your Mac routes through a proxy (e.g. Clash on :7890), run an SSH tunnel first:
+#   ssh -N -L 11434:localhost:11434 yz@10.130.138.37
+# then set EDGE_VLM_BASE_URL=http://localhost:11434/v1 in .env
+EDGE_VLM_BASE_URL: str = os.getenv("EDGE_VLM_BASE_URL", "http://10.130.138.37:11434/v1")
+EDGE_VLM_API_KEY: str  = "ollama"          # Ollama ignores this but OpenAI client requires it
+EDGE_VLM_MODEL: str    = "qwen3.5:9b"
+EDGE_VLM_TEMPERATURE: float = 0.0
+
+# ─── Simulator backend ─────────────────────────────────────────────────────────
+# "mock"   — pure-Python simulated physics, no external simulator needed
+# "webots" — Webots extern controller via TCP (see controllers/webots_controller.py)
+SIMULATOR_BACKEND: str = os.getenv("SIMULATOR_BACKEND", "mock")
+
+# Webots extern controller TCP settings (only used when SIMULATOR_BACKEND="webots")
+WEBOTS_HOST: str = "localhost"
+WEBOTS_PORT: int = 10020          # base port; drone_N gets port 10020+N
+
+# ─── Mock physics ──────────────────────────────────────────────────────────────
+MOCK_MOVE_SPEED: float    = 5.0   # m/s (used by mock controller to advance position)
+MOCK_TICK_RATE: float     = 0.05  # seconds between physics ticks in mock (20 Hz)
+MOCK_IMAGE_WIDTH: int     = 320
+MOCK_IMAGE_HEIGHT: int    = 240
+
+# ─── Logging ───────────────────────────────────────────────────────────────────
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
