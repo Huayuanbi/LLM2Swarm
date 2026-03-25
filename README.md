@@ -16,8 +16,8 @@ Each drone runs an independent 10-second control loop: a **Cloud LLM** (GPT-4o o
    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
    │  10s loop    │  │  10s loop    │  │  10s loop    │
    │  Execute     │  │  Execute     │  │  Execute     │
-   │  Perceive ───┼──┼── Memory ───┼──┼─── Perceive  │
-   │  VLM decide  │  │  Pool       │  │  VLM decide  │
+   │  Perceive ───┼──┼─ Memory   ───┼──┼─ Perceive    │
+   │  VLM decide  │  │  Pool        │  │  VLM decide  │
    └──────────────┘  └──────────────┘  └──────────────┘
           │                 │                  │
           └─────────────────▼──────────────────┘
