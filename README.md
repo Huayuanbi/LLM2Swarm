@@ -28,21 +28,21 @@ Each drone runs an independent 10-second control loop: a **Cloud LLM** (GPT-4o o
 ## 🗺️ Roadmap & TODOs
 
 ### 1. Simulator & Environment Setup
-- [ ] Set up dual simulator support: Webots (for macOS) and AirSim (for Windows).
-- [ ] Develop a unified flight control API wrapper to abstract simulator-specific commands.
-- [ ] Construct custom simulation environments/scenes for drone testing.
+- [ ] 模拟器选择: Webots for Mac or Airsim for Windows
+- [ ] 模拟器飞控接口包装
+- [ ] 实验场景环境构建（例如火灾场景）
+- [ ] 摄像头以及图像的处理
 
 ### 2. Cloud-Edge Architecture & Latency Fixes
-- [ ] Implement hierarchical task division: Cloud LLM (Global Strategy) vs. Edge VLM (Real-time Tactics).
-- [ ] Fix VLM latency issue: Constrain Qwen's prompt to bypass CoT (`<think>`) and enforce fast, zero-shot JSON outputs.
+- [ ] 云端LLM和边端VLM各自的输出范式以及精细度分工
+- [ ] 处理VLM的输出延迟问题: Qwen3.5-4b等思考模型的长上下文思考会有几十秒的耗时
 
 ### 3. Action Space Design
-- [ ] Build a predefined, safe library of atomic flight actions (encapsulated primitives).
-- [ ] Enforce parameter-based action triggering (strictly prohibit LLM/VLM from generating raw flight control code).
+- [ ] 构建action list
+- [ ] *遗留问题* vlm（llm）是直接写动作调用（飞控）代码还是像之前一样多加一层中间层来处理
 
-### 4. GPT-4o API Scheduling
-- [ ] Implement an asynchronous dispatcher for GPT-4o API calls to prevent blocking the main loop.
-- [ ] Develop a centralized state aggregator to batch drone queries and manage API rate limits.
+### 4. Cloud LLM API
+- [ ] GPT-4o API Key 或者本地大模型，主要取决于2.1的任务强度
 
 ## Architecture
 
