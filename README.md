@@ -2,27 +2,30 @@
 
 An edge-cloud collaborative multi-drone swarm system driven by large language models.
 
-Each drone runs an independent 10-second control loop: a **Cloud LLM** (GPT-4o or Ollama) generates the initial mission plan, and an **Edge VLM** (qwen3.5:9b via Ollama) replans in real time based on camera perception and swarm-wide state.
+Each drone runs an independent control loop: a **Cloud LLM** (GPT-4o or Ollama) generates the initial mission plan, and an **Edge VLM** (qwen3.5:4b via Ollama) replans in real time based on camera perception and swarm-wide state.
+
+The VLM fires concurrently with action execution — drones never pause to wait for inference. A VLM tick fires every 10 seconds in the background; the drone continues executing its current action throughout.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Cloud LLM (GPT-4o)                     │
-│              Natural language → per-drone task plan         │
+│              Natural language → per-drone task list         │
 └───────────────────────────┬─────────────────────────────────┘
                             │ initial plan
           ┌─────────────────┼──────────────────┐
           ▼                 ▼                  ▼
       [drone_1]         [drone_2]          [drone_3]
    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-   │  10s loop    │  │  10s loop    │  │  10s loop    │
-   │  Execute     │  │  Execute     │  │  Execute     │
-   │  Perceive ───┼──┼─ Memory   ───┼──┼─ Perceive    │
-   │  VLM decide  │  │  Pool        │  │  VLM decide  │
-   └──────────────┘  └──────────────┘  └──────────────┘
+   │  Execute ────┼──┼─ Memory   ───┼──┼─ Execute     │
+   │  (action) ──┐│  │  Pool        │  │              │
+   │  VLM tick  ││  └──────────────┘  └──────────────┘
+   │  (parallel)┘│
+   └──────────────┘
           │                 │                  │
           └─────────────────▼──────────────────┘
-                    Edge VLM (qwen3.5:9b)
+                    Edge VLM (qwen3.5:4b)
                   Ollama on remote Linux server
+                  (concurrent execution enabled)
 ```
 
 ## 🗺️ Roadmap & TODOs
@@ -63,7 +66,7 @@ Each drone runs an independent 10-second control loop: a **Cloud LLM** (GPT-4o o
 
 - **macOS** (primary dev platform) or Linux
 - **Python 3.11+** via conda
-- **Ollama** running on a remote Linux server with `qwen3.5:9b` pulled
+- **Ollama** running on a remote Linux server with `qwen3.5:4b` pulled, concurrent mode enabled (`OLLAMA_NUM_PARALLEL=3`)
 - **OpenAI API key** with credits (optional — falls back to Ollama if unavailable)
 - SSH access to the Ollama server
 
@@ -98,10 +101,10 @@ OPENAI_API_KEY=sk-...
 # Run: ssh -N -f -L 11435:localhost:11434 <user>@<server-ip>
 EDGE_VLM_BASE_URL=http://localhost:11435/v1
 
-# To use qwen3.5:9b as GPT-4o substitute (no OpenAI credits needed):
+# To use qwen3.5:4b as GPT-4o substitute (no OpenAI credits needed):
 GLOBAL_LLM_BASE_URL=http://localhost:11435/v1
 GLOBAL_LLM_API_KEY=ollama
-GLOBAL_LLM_MODEL=qwen3.5:9b
+GLOBAL_LLM_MODEL=qwen3.5:4b
 
 # Simulator: "mock" (no simulator needed) or "webots"
 SIMULATOR_BACKEND=mock
@@ -173,7 +176,7 @@ Phase 3 results: 5 passed, 0 failed   # live VLM test passes
 | Scenario | `.env` settings |
 |---|---|
 | GPT-4o (production) | `OPENAI_API_KEY=sk-...` and no `GLOBAL_LLM_*` vars |
-| qwen3.5:9b via Ollama (no OpenAI credits) | `GLOBAL_LLM_BASE_URL=http://localhost:11435/v1`, `GLOBAL_LLM_API_KEY=ollama`, `GLOBAL_LLM_MODEL=qwen3.5:9b` |
+| qwen3.5:4b via Ollama (no OpenAI credits) | `GLOBAL_LLM_BASE_URL=http://localhost:11435/v1`, `GLOBAL_LLM_API_KEY=ollama`, `GLOBAL_LLM_MODEL=qwen3.5:4b` |
 
 No code changes needed — just update `.env`.
 
@@ -194,7 +197,9 @@ LLM2Swarm/
 ├── .env.example                 # Template — copy to .env
 ├── .gitignore
 ├── scripts/
-│   └── start_tunnel.sh          # SSH tunnel manager
+│   ├── start_tunnel.sh          # SSH tunnel manager
+│   ├── benchmark_thinking.py    # Measure qwen3 thinking-mode latency
+│   └── test_concurrent_vlm.py  # Verify Ollama concurrent execution
 ├── controllers/
 │   ├── base_controller.py       # Abstract DroneController
 │   ├── mock_controller.py       # Pure-Python mock (default)
@@ -214,6 +219,32 @@ LLM2Swarm/
     ├── test_phase2.py            # Memory pool + planner tests
     └── test_phase3.py            # Lifecycle + VLM integration tests
 ```
+
+## Atomic Action Space
+
+All actions are dispatched directly to the controller with no pre-processing in the lifecycle layer.
+
+| Action | Params | Behaviour |
+|---|---|---|
+| `takeoff` | `altitude` | Climb to altitude and hover |
+| `go_to_waypoint` | `x, y, z, velocity` | Fly straight line to waypoint |
+| `hover` | `duration` | Hold position for N seconds |
+| `search_pattern` | `center_x, center_y, radius, altitude` | **Continuous** circular orbit — loops forever until the VLM issues a `modify` decision |
+| `land` | — | Descend and disarm |
+
+`search_pattern` never completes on its own. The VLM is responsible for deciding when the area has been adequately covered and issuing a `modify` to move on.
+
+## Control Loop
+
+Each drone runs an independent loop:
+
+1. **Pop action** from queue and start it as a background task
+2. **Fire VLM tick** as a concurrent task at the same moment
+3. **Execute action** for up to `CONTROL_LOOP_INTERVAL` (10 s)
+4. **Collect VLM result** — if still running, await it (action keeps flying via `asyncio.shield`)
+5. VLM says `continue` → loop; VLM says `modify` → cancel action, prepend new one, loop
+
+If an action finishes early and the queue has more items, the drone moves on immediately without waiting for the VLM (a fresh tick fires at the next action start).
 
 ## VLM Decision Protocol
 
