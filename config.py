@@ -13,12 +13,12 @@ DRONE_IDS: list[str] = ["drone_1", "drone_2", "drone_3"]
 
 # ─── Control loop ──────────────────────────────────────────────────────────────
 CONTROL_LOOP_INTERVAL: float = 10.0   # seconds between perception/replanning ticks
-VLM_TIMEOUT: float           = 30.0   # max seconds to wait for edge VLM response (multimodal ~20s for 9b)
+VLM_TIMEOUT: float           = 20.0   # max seconds to wait for edge VLM response (multimodal ~10s for 4b)
 VLM_FALLBACK_DECISION: str   = "continue"  # used if VLM times out or errors
 
 # ─── Cloud LLM (Global Planner) ───────────────────────────────────────────────
 # To use GPT-4o:   GLOBAL_LLM_BASE_URL="" (or unset),  GLOBAL_LLM_MODEL="gpt-4o"
-# To use Ollama:   GLOBAL_LLM_BASE_URL=http://localhost:11435/v1, GLOBAL_LLM_MODEL=qwen3.5:9b
+# To use Ollama:   GLOBAL_LLM_BASE_URL=http://localhost:11435/v1, GLOBAL_LLM_MODEL=qwen3.5:4b
 OPENAI_API_KEY: str       = os.getenv("OPENAI_API_KEY", "")
 GLOBAL_LLM_BASE_URL: str  = os.getenv("GLOBAL_LLM_BASE_URL", "")   # empty = use OpenAI default
 GLOBAL_LLM_API_KEY: str   = os.getenv("GLOBAL_LLM_API_KEY", "") or OPENAI_API_KEY
@@ -30,7 +30,7 @@ GLOBAL_LLM_MODEL: str     = os.getenv("GLOBAL_LLM_MODEL", "gpt-4o")
 # then set EDGE_VLM_BASE_URL=http://localhost:11434/v1 in .env
 EDGE_VLM_BASE_URL: str = os.getenv("EDGE_VLM_BASE_URL", "http://10.130.138.37:11434/v1")
 EDGE_VLM_API_KEY: str  = "ollama"          # Ollama ignores this but OpenAI client requires it
-EDGE_VLM_MODEL: str    = "qwen3.5:9b"
+EDGE_VLM_MODEL: str    = "qwen3.5:4b"
 EDGE_VLM_TEMPERATURE: float = 0.0
 
 # ─── Simulator backend ─────────────────────────────────────────────────────────

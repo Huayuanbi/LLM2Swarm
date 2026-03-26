@@ -10,7 +10,8 @@
       "Bash(/Users/hyb/LocalProj/LLM2Swarm/scripts/start_tunnel.sh --status)",
       "Bash(git init:*)",
       "Bash(git add:*)",
-      "Bash(git --version)"
+      "Bash(git --version)",
+      "Bash(bash scripts/start_tunnel.sh 2>&1)"
     ]
   }
 }

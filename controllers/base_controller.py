@@ -108,8 +108,9 @@ class DroneController(ABC):
         altitude: float = 10.0,
     ) -> None:
         """
-        Execute a circular search orbit at the given centre and radius.
-        Returns after one full orbit.
+        Execute a continuous circular search orbit at the given centre and radius.
+        Loops indefinitely — never returns on its own. The VLM must issue a
+        "modify" decision to cancel it and move to the next task.
         """
         ...
 

@@ -1,5 +1,5 @@
 """
-operators/vlm_agent.py — Edge VLM Local Replanner (qwen3.5:9b via Ollama).
+operators/vlm_agent.py — Edge VLM Local Replanner (qwen3.5:4b via Ollama).
 
 Called once per 10-second control loop tick for each drone.  Takes:
   - The drone's current telemetry (position, velocity, status)
@@ -58,17 +58,25 @@ If the situation requires a change (obstacle, better strategy, teammate conflict
 }
 
 AVAILABLE SKILLS: takeoff, go_to_waypoint, hover, search_pattern, land
+
+IMPORTANT — search_pattern is a CONTINUOUS loop. It orbits forever and will
+NEVER finish on its own. When a drone is executing search_pattern and you judge
+that the area has been adequately covered (typically after 1–2 full laps), you
+MUST issue a "modify" decision to move it to the next task (e.g. land or hover).
+
 RULES:
   1. Default to "continue" unless you observe a clear reason to change.
   2. Avoid sending two drones to the same waypoint simultaneously.
   3. memory_update should be a concise factual observation (max 20 words).
   4. Return ONLY the JSON object — nothing else.
+  5. If active task is search_pattern and the area appears adequately searched,
+     issue "modify" with an appropriate next action (land, hover, or go_to_waypoint).
 """
 
 
 class VLMAgent:
     """
-    Wraps the Ollama-hosted qwen3.5:9b endpoint with the same AsyncOpenAI
+    Wraps the Ollama-hosted qwen3.5:4b endpoint with the same AsyncOpenAI
     client interface (Ollama's OpenAI-compatible /v1 API).
     """
 
@@ -186,9 +194,12 @@ def _build_user_content(
 def _parse_vlm_response(raw: str) -> VLMDecision:
     """
     Extract and validate JSON from the VLM's text output.
-    Handles markdown fences and leading/trailing prose.
+    Strips <think>…</think> blocks (qwen3 thinking mode), markdown fences,
+    and any leading/trailing prose.
     """
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
+    # Remove thinking blocks — present when /no_think is ignored or unavailable
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned).strip()
     match   = re.search(r"\{.*\}", cleaned, re.DOTALL)
     if not match:
         raise ValueError(f"No JSON object in VLM response: {cleaned!r}")

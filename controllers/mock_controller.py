@@ -43,7 +43,11 @@ class MockDroneController(DroneController):
     Suitable for unit tests and end-to-end logic validation.
     """
 
-    def __init__(self, drone_id: str):
+    def __init__(
+        self,
+        drone_id: str,
+        sim_positions: Optional[dict] = None,
+    ):
         super().__init__(drone_id)
         # --- State ---
         self._pos: list[float] = [0.0, 0.0, 0.0]    # [x, y, z]
@@ -53,6 +57,8 @@ class MockDroneController(DroneController):
         self._move_speed: float = config.MOCK_MOVE_SPEED
         self._tick_task: Optional[asyncio.Task] = None
         self._frame_counter: int = 0                 # increments each image capture
+        # Shared simulator state dict written by physics loop, read by visualizer
+        self._sim_positions: Optional[dict] = sim_positions
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -107,6 +113,11 @@ class MockDroneController(DroneController):
             self._pos[0] += dx * scale
             self._pos[1] += dy * scale
             self._pos[2] += dz * scale
+
+            # Publish to simulator bridge so visualizer can read without going
+            # through the memory pool (which is only updated every 10 s)
+            if self._sim_positions is not None:
+                self._sim_positions[self.drone_id] = list(self._pos)
 
     async def _fly_to(self, x: float, y: float, z: float, velocity: float) -> None:
         """
@@ -215,17 +226,21 @@ class MockDroneController(DroneController):
         altitude: float = 10.0,
     ) -> None:
         """
-        Circular search orbit: 8 equally-spaced waypoints around the centre.
+        Continuous circular search orbit: loops forever until cancelled.
+        The VLM is expected to issue a "modify" decision to stop the search.
         """
         logger.info(
-            "[%s] search_pattern: centre=(%.1f,%.1f) r=%.1f alt=%.1f",
+            "[%s] search_pattern: centre=(%.1f,%.1f) r=%.1f alt=%.1f — looping until VLM stops",
             self.drone_id, center_x, center_y, radius, altitude,
         )
         n_points = 8
-        for i in range(n_points + 1):   # +1 to close the loop
-            angle = 2 * math.pi * i / n_points
-            wp_x  = center_x + radius * math.cos(angle)
-            wp_y  = center_y + radius * math.sin(angle)
-            await self.go_to_waypoint(wp_x, wp_y, altitude, velocity=4.0)
-
-        logger.info("[%s] search_pattern complete.", self.drone_id)
+        lap = 0
+        while True:
+            lap += 1
+            logger.info("[%s] search_pattern: starting lap %d", self.drone_id, lap)
+            for i in range(n_points):
+                angle = 2 * math.pi * i / n_points
+                wp_x  = center_x + radius * math.cos(angle)
+                wp_y  = center_y + radius * math.sin(angle)
+                await self.go_to_waypoint(wp_x, wp_y, altitude, velocity=4.0)
+            logger.info("[%s] search_pattern: lap %d complete.", self.drone_id, lap)

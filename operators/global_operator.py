@@ -62,7 +62,10 @@ RULES:
   1. Every drone must begin its task list with a takeoff action.
   2. Assign tasks only to drones listed in the mission context.
   3. Use realistic coordinates (metres, NED frame). Keep values under 200 m.
-  4. Return ONLY the JSON object — nothing else.
+  4. Before every search_pattern action, always insert a go_to_waypoint to
+     (center_x, center_y, altitude) so the drone explicitly flies to the
+     search area first — do not assume it is already there.
+  5. Return ONLY the JSON object — nothing else.
 """
 
 
@@ -183,8 +186,9 @@ def _parse_plan(raw: str, drone_ids: list[str]) -> GlobalPlan:
       1. JSON wrapped in ```json ... ``` markdown fences.
       2. Extra commentary before/after the JSON object.
     """
-    # Strip markdown code fences if present
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip()
+    # Strip thinking blocks (qwen3 thinking mode)
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned).strip()
 
     # Extract the outermost {...} block in case there's surrounding text
     match = re.search(r"\{.*\}", cleaned, re.DOTALL)
