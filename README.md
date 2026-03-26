@@ -25,6 +25,25 @@ Each drone runs an independent 10-second control loop: a **Cloud LLM** (GPT-4o o
                   Ollama on remote Linux server
 ```
 
+## 🗺️ Roadmap & TODOs
+
+### 1. Simulator & Environment Setup
+- [ ] Set up dual simulator support: Webots (for macOS) and AirSim (for Windows).
+- [ ] Develop a unified flight control API wrapper to abstract simulator-specific commands.
+- [ ] Construct custom simulation environments/scenes for drone testing.
+
+### 2. Cloud-Edge Architecture & Latency Fixes
+- [ ] Implement hierarchical task division: Cloud LLM (Global Strategy) vs. Edge VLM (Real-time Tactics).
+- [ ] Fix VLM latency issue: Constrain Qwen's prompt to bypass CoT (`<think>`) and enforce fast, zero-shot JSON outputs.
+
+### 3. Action Space Design
+- [ ] Build a predefined, safe library of atomic flight actions (encapsulated primitives).
+- [ ] Enforce parameter-based action triggering (strictly prohibit LLM/VLM from generating raw flight control code).
+
+### 4. GPT-4o API Scheduling
+- [ ] Implement an asynchronous dispatcher for GPT-4o API calls to prevent blocking the main loop.
+- [ ] Develop a centralized state aggregator to batch drone queries and manage API rate limits.
+
 ## Architecture
 
 | Module | Purpose |
