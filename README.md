@@ -7,25 +7,35 @@ Each drone runs an independent control loop: a **Cloud LLM** (GPT-4o or Ollama) 
 The VLM fires concurrently with action execution — drones never pause to wait for inference. A VLM tick fires every 10 seconds in the background; the drone continues executing its current action throughout.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Cloud LLM (GPT-4o)                     │
-│              Natural language → per-drone task list         │
-└───────────────────────────┬─────────────────────────────────┘
-                            │ initial plan
-          ┌─────────────────┼──────────────────┐
-          ▼                 ▼                  ▼
-      [drone_1]         [drone_2]          [drone_3]
-   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-   │  Execute ────┼──┼─ Memory   ───┼──┼─ Execute     │
-   │  (action) ──┐│  │  Pool        │  │              │
-   │  VLM tick  ││  └──────────────┘  └──────────────┘
-   │  (parallel)┘│
-   └──────────────┘
-          │                 │                  │
-          └─────────────────▼──────────────────┘
-                    Edge VLM (qwen3.5:4b)
-                  Ollama on remote Linux server
-                  (concurrent execution enabled)
+┌──────────────────────────────────────────────────────────────────┐
+│                       Cloud LLM (GPT-4o)                         │
+│               Natural language → per-drone task list             │
+└──────────────┬───────────────────┬───────────────────┬───────────┘
+               │ drone_1 plan      │ drone_2 plan      │ drone_3 plan
+               ▼                   ▼                   ▼
+       ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+       │   drone_1    │    │   drone_2    │    │   drone_3    │
+       │              │    │              │    │              │
+       │  action task │    │  action task │    │  action task │
+       │  (running)   │    │  (running)   │    │  (running)   │
+       │      +       │    │      +       │    │      +       │
+       │  VLM tick    │    │  VLM tick    │    │  VLM tick    │
+       │  (parallel)  │    │  (parallel)  │    │  (parallel)  │
+       └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
+              │                   │                   │
+              └───────────────────┼───────────────────┘
+                                  │ position / observations
+                         ┌────────▼────────┐
+                         │  Shared Memory  │
+                         │      Pool       │
+                         └────────┬────────┘
+                                  │ peer states
+                         ┌────────▼────────┐
+                         │  Edge VLM       │
+                         │  qwen3.5:4b     │
+                         │  (Ollama,       │
+                         │   concurrent)   │
+                         └─────────────────┘
 ```
 
 ## 🗺️ Roadmap & TODOs
