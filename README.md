@@ -129,7 +129,7 @@ LLM2Swarm/
 推荐安装步骤：
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/Huayuanbi/LLM2Swarm.git
 cd LLM2Swarm
 
 conda create -n llm2swarm python=3.11 -y
@@ -245,7 +245,7 @@ python main.py --mission "Drone 1 patrol sector A, Drone 2 standby at base"
 
 ### 3. 多机 Webots Demo
 
-多机版本现在采用“云端先初始化，全局平等下发”的方式，而不是让某一架无人机兼任 leader 规划器。
+多机版本现在采用“云端先初始化，全局平等下发”的方式。
 
 启动方法：
 
