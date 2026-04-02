@@ -148,7 +148,7 @@ Forest {
   minRadius 3
 }
 Mavic2Pro {
-  translation 0 0 0.1
+  translation -12 -12 0.1
   rotation 0 0 1 3.141590777218456
   name "drone_1"
   controller "llm2swarm_multi"
@@ -161,10 +161,26 @@ Mavic2Pro {
       height 240
       near 0.2
     }
+    Pose {
+      translation 0 0 0.32
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.95 0.2 0.2
+            emissiveColor 0.95 0.2 0.2
+            roughness 1
+            metalness 0
+          }
+          geometry Sphere {
+            radius 0.12
+          }
+        }
+      ]
+    }
   ]
 }
 Mavic2Pro {
-  translation 2.5 -2.5 0.1
+  translation 12 -12 0.1
   rotation 0 0 1 3.141590777218456
   name "drone_2"
   controller "llm2swarm_multi"
@@ -177,10 +193,26 @@ Mavic2Pro {
       height 240
       near 0.2
     }
+    Pose {
+      translation 0 0 0.32
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.2 0.9 0.25
+            emissiveColor 0.2 0.9 0.25
+            roughness 1
+            metalness 0
+          }
+          geometry Sphere {
+            radius 0.12
+          }
+        }
+      ]
+    }
   ]
 }
 Mavic2Pro {
-  translation -2.5 2.5 0.1
+  translation 0 12 0.1
   rotation 0 0 1 3.141590777218456
   name "drone_3"
   controller "llm2swarm_multi"
@@ -192,6 +224,22 @@ Mavic2Pro {
       width 400
       height 240
       near 0.2
+    }
+    Pose {
+      translation 0 0 0.32
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 0.2 0.45 1
+            emissiveColor 0.2 0.45 1
+            roughness 1
+            metalness 0
+          }
+          geometry Sphere {
+            radius 0.12
+          }
+        }
+      ]
     }
   ]
 }

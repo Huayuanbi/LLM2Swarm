@@ -85,6 +85,7 @@ class WebotsController(DroneController):
     K_PITCH_P = 30.0
     MAX_YAW_DISTURBANCE = 0.8
     MAX_PITCH_DISTURBANCE = -1.0
+    MAX_ROLL_DISTURBANCE = 1.0
 
     TARGET_XY_TOL = 0.6
     TARGET_Z_TOL = 0.35
@@ -93,6 +94,11 @@ class WebotsController(DroneController):
     ACTION_POLL_INTERVAL = 0.05
     SEARCH_WAYPOINTS = 8
     IMAGE_UPDATE_INTERVAL_STEPS = 4
+    YAW_ALIGN_FOR_TRANSLATION = 0.55
+    FORWARD_POS_GAIN = 0.065
+    FORWARD_VEL_GAIN = 0.020
+    LATERAL_POS_GAIN = 0.090
+    LATERAL_VEL_GAIN = 0.030
     _process_robot_lock = threading.Lock()
     _process_robot_owner: Optional[str] = None
 
@@ -113,6 +119,7 @@ class WebotsController(DroneController):
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
+        self._state_ready_event = threading.Event()
         self._image_ready_event = threading.Event()
         self._state_lock = threading.Lock()
         self._thread_error: Optional[BaseException] = None
@@ -156,6 +163,7 @@ class WebotsController(DroneController):
 
         self._stop_event.clear()
         self._ready_event.clear()
+        self._state_ready_event.clear()
         self._image_ready_event.clear()
         self._thread_error = None
 
@@ -168,6 +176,7 @@ class WebotsController(DroneController):
 
         try:
             await self._wait_for_ready(timeout=10.0)
+            await self._wait_for_state_ready(timeout=5.0)
         except Exception:
             with self._process_robot_lock:
                 if self._process_robot_owner == self.drone_id:
@@ -413,6 +422,7 @@ class WebotsController(DroneController):
             if self._mode == "idle" and self._target_position == [0.0, 0.0, 0.0]:
                 self._hold_position = list(current_position)
                 self._target_position = list(current_position)
+        self._state_ready_event.set()
 
         self._last_sensor_time = now
         self._last_sensor_position = current_position
@@ -478,18 +488,32 @@ class WebotsController(DroneController):
                 self.MAX_YAW_DISTURBANCE,
             )
 
-            if abs(angle_left) < 1.0:
+            forward_error_body = math.cos(yaw) * dx + math.sin(yaw) * dy
+            lateral_error_body = -math.sin(yaw) * dx + math.cos(yaw) * dy
+            forward_velocity_body = math.cos(yaw) * vx + math.sin(yaw) * vy
+            lateral_velocity_body = -math.sin(yaw) * vx + math.cos(yaw) * vy
+
+            if abs(angle_left) < self.YAW_ALIGN_FOR_TRANSLATION:
                 pitch_disturbance = _clamp(
-                    -0.08 * planar_distance,
+                    -self.FORWARD_POS_GAIN * forward_error_body
+                    - self.FORWARD_VEL_GAIN * forward_velocity_body,
                     self.MAX_PITCH_DISTURBANCE,
-                    0.2,
+                    0.35,
+                )
+                roll_disturbance = _clamp(
+                    self.LATERAL_POS_GAIN * lateral_error_body
+                    - self.LATERAL_VEL_GAIN * lateral_velocity_body,
+                    -self.MAX_ROLL_DISTURBANCE,
+                    self.MAX_ROLL_DISTURBANCE,
                 )
             else:
                 pitch_disturbance = 0.0
+                roll_disturbance = 0.0
 
         elif mode in {"hover", "land", "idle"}:
             yaw_disturbance = 0.0
             pitch_disturbance = 0.0
+            roll_disturbance = 0.0
 
         clamped_difference_altitude = _clamp(
             target_z - altitude + self.K_VERTICAL_OFFSET,
@@ -601,6 +625,14 @@ class WebotsController(DroneController):
                 raise TimeoutError("Timed out while waiting for Webots controller thread to start.")
             await asyncio.sleep(self.ACTION_POLL_INTERVAL)
         await self._ensure_no_thread_error()
+
+    async def _wait_for_state_ready(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while not self._state_ready_event.is_set():
+            await self._ensure_no_thread_error()
+            if time.monotonic() > deadline:
+                raise TimeoutError("Timed out while waiting for initial Webots sensor state.")
+            await asyncio.sleep(self.ACTION_POLL_INTERVAL)
 
     async def _wait_for_action(self, action_id: int) -> None:
         try:
