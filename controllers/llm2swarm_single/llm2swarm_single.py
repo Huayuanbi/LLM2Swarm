@@ -34,8 +34,11 @@ load_dotenv(REPO_ROOT / ".env")
 import config
 from controllers.webots_controller import WebotsController
 from memory.pool import SharedMemoryPool
+from models.schemas import DroneState, OnboardPlanningContext, RoleBrief
 from operators.drone_lifecycle import DroneLifecycle
 from operators.global_operator import GlobalOperator
+from operators.local_planner import build_task_graph_runtime
+from operators.onboard_planner import OnboardPlannerAgent
 from operators.vlm_agent import VLMAgent
 
 logging.basicConfig(
@@ -56,42 +59,67 @@ DEFAULT_MISSION = os.getenv(
 )
 
 
-def _fallback_tasks() -> list[dict]:
-    return [
-        {"action": "takeoff", "params": {"altitude": 12.0}},
-        {
-            "action": "go_to_waypoint",
-            "params": {"x": -35.0, "y": 10.0, "z": 12.0, "velocity": 3.0},
+def _fallback_role() -> RoleBrief:
+    return RoleBrief(
+        mission_role="Single-drone perimeter inspection",
+        mission_intent=(
+            "Inspect the rural manor perimeter, adapt to local observations, "
+            "and keep the shared memory updated with relevant findings."
+        ),
+        responsibilities=[
+            "inspect the assigned perimeter zone",
+            "report meaningful scene changes",
+        ],
+        coordination_contracts=[
+            "publish notable detections immediately to the memory pool",
+        ],
+        event_watchlist=[
+            "obstacle_detected",
+            "target_detected",
+            "region_complete",
+        ],
+        initial_hints=[
+            "begin with a safe takeoff and move toward the manor perimeter context if available",
+            "keep the initial graph small and rely on runtime replanning",
+        ],
+        shared_context={
+            "area_label": "manor perimeter",
+            "bootstrap_actions": [
+                {"action": "takeoff", "params": {"altitude": 12.0}},
+                {"action": "go_to_waypoint", "params": {"x": -35.0, "y": 10.0, "z": 12.0, "velocity": 3.0}},
+                {"action": "search_pattern", "params": {"center_x": -35.0, "center_y": 10.0, "radius": 20.0, "altitude": 12.0}},
+            ],
         },
-        {
-            "action": "search_pattern",
-            "params": {
-                "center_x": -35.0,
-                "center_y": 10.0,
-                "radius": 20.0,
-                "altitude": 12.0,
-            },
-        },
-    ]
+    )
 
 
-async def _get_initial_tasks(drone_id: str, mission: str) -> list[dict]:
+async def _get_initial_role(
+    drone_id: str,
+    mission: str,
+    *,
+    initial_state: dict,
+    agent_profile: dict,
+) -> RoleBrief:
     if not (config.OPENAI_API_KEY or config.GLOBAL_LLM_BASE_URL):
-        logger.info("No global planner configured; using fallback task list.")
-        return _fallback_tasks()
+        logger.info("No global planner configured; using fallback role brief.")
+        return _fallback_role()
 
     try:
         operator = GlobalOperator(drone_ids=[drone_id])
-        plan = await operator.plan_mission(mission)
-        tasks = plan.get_tasks(drone_id)
-        if tasks:
-            logger.info("Initial task list received from GlobalOperator.")
-            return tasks
-        logger.warning("GlobalOperator returned no tasks for %s; using fallback plan.", drone_id)
+        role_plan = await operator.assign_roles(
+            mission,
+            initial_states={drone_id: initial_state},
+            agent_profiles={drone_id: agent_profile},
+        )
+        role = role_plan.get_role(drone_id)
+        if role is not None:
+            logger.info("Initial role brief received from GlobalOperator.")
+            return role
+        logger.warning("GlobalOperator returned no role for %s; using fallback role.", drone_id)
     except Exception as exc:
-        logger.warning("GlobalOperator failed (%s); using fallback plan.", exc)
+        logger.warning("GlobalOperator failed (%s); using fallback role.", exc)
 
-    return _fallback_tasks()
+    return _fallback_role()
 
 
 async def _run_demo() -> None:
@@ -100,18 +128,50 @@ async def _run_demo() -> None:
 
     memory = SharedMemoryPool([DRONE_ID])
     vlm = VLMAgent()
+    onboard_planner = OnboardPlannerAgent()
     controller = WebotsController(DRONE_ID)
-    initial_tasks = await _get_initial_tasks(DRONE_ID, DEFAULT_MISSION)
-
-    logger.info("Initial tasks: %s", " -> ".join(t["action"] for t in initial_tasks))
-
     await controller.connect()
+    pos = await controller.get_position()
+    await memory.update_drone(DRONE_ID, position=list(pos), status="idle")
+    role = await _get_initial_role(
+        DRONE_ID,
+        DEFAULT_MISSION,
+        initial_state={
+            "position": list(pos),
+            "status": "idle",
+        },
+        agent_profile=controller.get_agent_profile().model_dump(),
+    )
+    planning_response = await onboard_planner.build_initial_task_graph(
+        OnboardPlanningContext(
+            drone_id=DRONE_ID,
+            role_brief=role,
+            self_state=DroneState(drone_id=DRONE_ID, position=list(pos), status="idle"),
+            peer_states={},
+            active_claims=[],
+            active_events=[],
+            agent_profile=controller.get_agent_profile(),
+            available_primitives=controller.get_available_primitive_specs(),
+            available_capabilities=controller.get_capability_tags(),
+        )
+    )
+    task_graph = build_task_graph_runtime(
+        DRONE_ID,
+        role,
+        planning_response.task_graph,
+        agent_profile=controller.get_agent_profile(),
+    )
+
+    logger.info("Role brief: %s", role.mission_role)
+    logger.info("Initial task graph: %s", planning_response.task_graph.summary or planning_response.task_graph.graph_id)
+    logger.info("Bootstrap actions: %s", " -> ".join(t["action"] for t in task_graph.preview_actions()) or "(none)")
+
     lifecycle = DroneLifecycle(
         drone_id=DRONE_ID,
         controller=controller,
         memory=memory,
         vlm=vlm,
-        initial_tasks=initial_tasks,
+        task_graph=task_graph,
         stop_when_empty=False,
     )
 

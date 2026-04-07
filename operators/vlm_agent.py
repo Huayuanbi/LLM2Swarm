@@ -21,12 +21,21 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Optional
 
 from openai import AsyncOpenAI
 
 import config
-from models.schemas import DroneState, VLMDecision, parse_vlm_decision
+from models.schemas import (
+    DroneState,
+    PrimitiveSpec,
+    TaskClaim,
+    TaskEvent,
+    VLMDecision,
+    parse_vlm_decision,
+)
+from primitives.registry import format_primitives_for_prompt
 from utils.image_utils import build_image_message
 
 logger = logging.getLogger(__name__)
@@ -54,23 +63,27 @@ If the situation requires a change (obstacle, better strategy, teammate conflict
   "decision":      "modify",
   "new_task":      "<human-readable description of new task>",
   "new_action":    {"action": "<skill_name>", "params": {<key>: <value>}},
+  "task_graph_patch": {"reason": "<optional reason>", "prepend_nodes": [...], "prepend_edges": [...]},
+  "event":         {"type": "<optional swarm event>", "source": "vlm", "priority": 1, "payload": {...}},
   "memory_update": "<brief observation to share with the swarm>"
 }
-
-AVAILABLE SKILLS: takeoff, go_to_waypoint, hover, search_pattern, land
-
-IMPORTANT — search_pattern is a CONTINUOUS loop. It orbits forever and will
-NEVER finish on its own. When a drone is executing search_pattern and you judge
-that the area has been adequately covered (typically after 1–2 full laps), you
-MUST issue a "modify" decision to move it to the next task (e.g. land or hover).
 
 RULES:
   1. Default to "continue" unless you observe a clear reason to change.
   2. Avoid sending two drones to the same waypoint simultaneously.
-  3. memory_update should be a concise factual observation (max 20 words).
-  4. Return ONLY the JSON object — nothing else.
-  5. If active task is search_pattern and the area appears adequately searched,
-     issue "modify" with an appropriate next action (land, hover, or go_to_waypoint).
+  3. If you observe a meaningful scene event, you MAY include a structured
+     event in the "event" field. Prefer concise generic event types such as
+     "target_detected", "obstacle_detected", "region_complete", or
+     "task_blocked", with structured payload fields.
+  4. You may use either new_action or task_graph_patch or both. Prefer the
+     smallest valid change that helps this drone progress safely.
+  5. memory_update should be a concise factual observation (max 20 words).
+  6. Return ONLY the JSON object — nothing else.
+  7. Only propose primitives that are explicitly listed as available to this agent.
+  8. Respect active swarm claims shown in the prompt. If another drone already
+     owns a target claim, avoid redirecting this drone to the same target.
+  9. Use active swarm events shown in the prompt as shared context when making
+     your decision, but only modify this drone's task when necessary.
 """
 
 
@@ -95,6 +108,10 @@ class VLMAgent:
         current_task: Optional[str],
         image_b64:    str,
         peer_states:  dict[str, DroneState],
+        claims:       Optional[list[TaskClaim]] = None,
+        events:       Optional[list[TaskEvent]] = None,
+        available_primitives: Optional[list[PrimitiveSpec]] = None,
+        available_capabilities: Optional[list[str]] = None,
     ) -> VLMDecision:
         """
         Ask the edge VLM whether the drone should continue or modify its task.
@@ -102,7 +119,17 @@ class VLMAgent:
         Falls back to VLMContinue on timeout or parse error.
         """
         user_content = _build_user_content(
-            drone_id, position, velocity, status, current_task, image_b64, peer_states
+            drone_id,
+            position,
+            velocity,
+            status,
+            current_task,
+            image_b64,
+            peer_states,
+            claims or [],
+            events or [],
+            available_primitives or [],
+            available_capabilities or [],
         )
 
         try:
@@ -152,6 +179,10 @@ def _build_user_content(
     current_task: Optional[str],
     image_b64:    str,
     peer_states:  dict[str, DroneState],
+    claims:       list[TaskClaim],
+    events:       list[TaskEvent],
+    available_primitives: list[PrimitiveSpec],
+    available_capabilities: list[str],
 ) -> list[dict]:
     """
     Build the multimodal message content list:
@@ -171,6 +202,24 @@ def _build_user_content(
         )
     peer_summary = "\n".join(peer_lines) if peer_lines else "  (no peers)"
 
+    claim_lines = []
+    for claim in claims:
+        remaining = max(0.0, claim.expires_at - time.time())
+        claim_lines.append(
+            f"  {claim.claim_type}:{claim.target_key} owned_by={claim.claimant_id} "
+            f"payload={claim.payload} lease={remaining:.0f}s"
+        )
+    claim_summary = "\n".join(claim_lines) if claim_lines else "  (no active claims)"
+
+    event_lines = []
+    for event in events[-10:]:
+        event_lines.append(
+            f"  {event.type} from={event.source} priority={event.priority} payload={event.payload}"
+        )
+    event_summary = "\n".join(event_lines) if event_lines else "  (no active shared events)"
+    primitive_summary = format_primitives_for_prompt(available_primitives)
+    capability_summary = ", ".join(available_capabilities) if available_capabilities else "(unspecified)"
+
     text_prompt = (
         f"=== DRONE TELEMETRY ===\n"
         f"ID:           {drone_id}\n"
@@ -179,9 +228,13 @@ def _build_user_content(
         f"Status:       {status}\n"
         f"Active task:  {current_task or 'none'}\n"
         f"\n=== TEAMMATE STATES ===\n{peer_summary}\n"
+        f"\n=== ACTIVE SWARM CLAIMS ===\n{claim_summary}\n"
+        f"\n=== ACTIVE SWARM EVENTS ===\n{event_summary}\n"
+        f"\n=== AVAILABLE PRIMITIVES ===\n{primitive_summary}\n"
+        f"\n=== AVAILABLE CAPABILITIES ===\n  {capability_summary}\n"
         f"\n=== CAMERA IMAGE ===\n"
         f"The attached image is the current front-facing camera view.\n"
-        f"Analyse it for obstacles, points of interest, or fire/hazard signs.\n"
+        f"Analyse it for obstacles, targets, points of interest, completion cues, or conflicts.\n"
         f"\nBased on this information, return your JSON decision."
     )
 

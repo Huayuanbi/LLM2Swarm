@@ -7,9 +7,17 @@ defined here, keeping the operator/VLM logic simulator-agnostic.
 """
 
 from __future__ import annotations
-import asyncio
 import logging
 from abc import ABC, abstractmethod
+
+from models.schemas import AgentProfile, PrimitiveSpec
+from primitives.registry import (
+    build_agent_profile,
+    derive_capability_tags,
+    get_primitive_spec,
+    get_supported_primitives_for_controller,
+    normalize_primitive_handler_kwargs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +122,22 @@ class DroneController(ABC):
         """
         ...
 
+    def get_available_primitive_specs(self) -> list[PrimitiveSpec]:
+        return get_supported_primitives_for_controller(self)
+
+    def get_available_primitive_names(self) -> list[str]:
+        return [spec.name for spec in self.get_available_primitive_specs()]
+
+    def get_capability_tags(self) -> list[str]:
+        return derive_capability_tags(self.get_available_primitive_specs())
+
+    def get_agent_profile(self) -> AgentProfile:
+        return build_agent_profile(
+            agent_id=self.drone_id,
+            agent_kind=self.__class__.__name__,
+            primitive_names=self.get_available_primitive_names(),
+        )
+
     # ── Convenience helpers (shared across all backends) ──────────────────────
 
     async def execute_action(self, action: dict) -> None:
@@ -124,25 +148,21 @@ class DroneController(ABC):
         name   = action.get("action", "")
         params = action.get("params", {})
 
-        dispatch = {
-            "takeoff":        lambda p: self.takeoff(altitude=p.get("altitude", 5.0)),
-            "land":           lambda p: self.land(),
-            "go_to_waypoint": lambda p: self.go_to_waypoint(
-                                    x=p["x"], y=p["y"], z=p["z"],
-                                    velocity=p.get("velocity", 3.0)),
-            "hover":          lambda p: self.hover(duration=p.get("duration", 5.0)),
-            "search_pattern": lambda p: self.search_pattern(
-                                    center_x=p["center_x"],
-                                    center_y=p["center_y"],
-                                    radius=p["radius"],
-                                    altitude=p.get("altitude", 10.0)),
-        }
-
-        if name not in dispatch:
+        try:
+            spec = get_primitive_spec(name)
+        except KeyError:
             raise ValueError(
                 f"[{self.drone_id}] Unknown action '{name}'. "
-                f"Valid actions: {list(dispatch.keys())}"
+                f"Valid actions: {self.get_available_primitive_names()}"
             )
 
+        handler = getattr(self, spec.handler_name, None)
+        if not callable(handler):
+            raise ValueError(
+                f"[{self.drone_id}] Unsupported action '{name}' for this controller. "
+                f"Available actions: {self.get_available_primitive_names()}"
+            )
+
+        kwargs = normalize_primitive_handler_kwargs(spec, params)
         logger.info("[%s] Executing skill: %s  params=%s", self.drone_id, name, params)
-        await dispatch[name](params)
+        await handler(**kwargs)

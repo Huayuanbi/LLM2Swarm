@@ -1,426 +1,608 @@
 # LLM2Swarm
 
-一个由大语言模型驱动的云边协同多无人机系统原型。
+一个面向多智能体协同的云边协同框架原型。
 
-这个项目的核心目标是把自然语言任务分解成多架无人机的动作序列，并在执行过程中持续结合机载视觉进行重规划。
+这个仓库现在的目标，不再是“云端直接把每架无人机的动作列表规划到底”，而是提供一套更通用的接口：
 
-当前仓库同时支持三种运行形态：
+- 用户给出抽象任务，例如 `search the area for fire`
+- 云端只做角色分配，不直接给完整动作序列
+- 机载 planner 根据 `RoleBrief + 当前上下文 + 当前能力` 生成初始任务图
+- 执行中再由 VLM / 本地模型根据图像、共享记忆、事件来修改任务图
+- runtime 负责验证、执行、共享状态、协调 claim / event
 
-- `mock` 纯 Python 仿真，适合离线测试和主流程验证
-- `Webots` 单机 demo，已验证可以起飞并完成 `camera -> VLM -> action` 闭环
-- `Webots` 多机 demo，采用“云端先统一生成任务，再平等下发给各机”的初始化方式，并已实测跑通 `takeoff -> go_to_waypoint -> search_pattern`
+当前这套框架被用于无人机 demo，但接口是按“通用多智能体”去设计的，后续可以接更强模型、agent framework、不同 agent 类型，甚至地面机器人。
 
-## 核心思路
+## 当前定位
 
-系统分成两层：
+这个项目当前更像“群体智能运行框架 + Webots / mock 验证平台”，重点在：
 
-- 云端全局规划：`GlobalOperator` 接收自然语言任务，输出 `drone_id -> action list`
-- 边端局部重规划：每架无人机执行动作时，周期性把相机图像、位姿、速度和队友状态发给 `VLMAgent`，让 VLM 判断是继续还是修改任务
+- 抽象任务输入
+- 云端角色分工
+- 机载任务图生成
+- 共享记忆与事件流
+- primitive registry / capability registry
+- runtime 校验与执行
 
-其中每架无人机都有自己的独立控制循环：
+而不是某一个具体场景的写死策略。
 
-1. 从任务队列取出当前动作
-2. 开始执行动作
-3. 同时触发一次 VLM 观察与决策
-4. 如果 VLM 返回 `continue`，继续执行
-5. 如果 VLM 返回 `modify`，取消当前动作并把新动作插回队列
+火情搜索目前只是一个 `test sample`，不是框架的唯一目标。
 
-VLM 调用和动作执行是并发的，无人机不会停下来等待模型返回。
+## 总体流程
 
-## 当前状态
-
-已经可用的部分：
-
-- `mock` 后端完整可跑
-- 单机 Webots controller 已接通
-- Webots 相机图像已能传给 VLM
-- `VLMAgent` 已能通过 SSH tunnel 访问远端 Ollama / qwen
-- Webots 单机 demo 已实测能正常启动并完成起飞
-- Webots 多机 demo 已实测能完成起飞、到达初始航点并进入搜索模式
-- 多机 world 已为每架无人机添加彩色 marker，便于在场景中快速识别
-
-正在持续完善的部分：
-
-- 多机协同任务效果验证
-- 更稳定的 Webots 世界与任务配置
-- 更强的多机避碰与区域约束
-
-## 整体架构
-
-```text
-Natural-language mission
-        |
-        v
-Cloud planner (GlobalOperator)
-        |
-        v
-Per-drone action lists
-        |
-        +--------------------+--------------------+
-        |                    |                    |
-        v                    v                    v
-   drone_1 loop         drone_2 loop         drone_3 loop
-        |                    |                    |
-        | execute action     | execute action     | execute action
-        |       +            |       +            |       +
-        |   VLM tick         |   VLM tick         |   VLM tick
-        |                    |                    |
-        +---------- shared swarm state -----------+
-                           |
-                           v
-                    peer states / observations
+```mermaid
+flowchart TD
+    A["Natural-language mission"] --> B["Shared memory init"]
+    B --> C["Cloud role allocation<br/>GlobalOperator.assign_roles"]
+    C --> D["Per-agent RoleBrief"]
+    D --> E["Onboard task-graph synthesis<br/>OnboardPlannerAgent"]
+    E --> F["TaskGraph runtime<br/>LocalTaskGraph"]
+    F --> G["Primitive execution<br/>Controller backend"]
+    G --> H["DroneLifecycle tick loop"]
+    H --> I["VLM / onboard replanning"]
+    I --> F
+    H --> J["Shared states / claims / events"]
+    J --> C
+    J --> I
 ```
 
-在 Webots 中，飞控和 agent 也是分层的：
+可以把它理解成 5 层：
 
-- 高频飞控循环：常驻在 `WebotsController` 内部，负责 `robot.step()`、传感器读取、姿态控制和电机输出
-- 低频 agent 循环：常驻在 `DroneLifecycle`，负责动作推进和 VLM tick
+1. `Mission layer`
+用户给出粗粒度任务，不直接规定动作。
 
-## 目录说明
+2. `Cloud role layer`
+云端根据 mission、初始状态、agent profile 产出 `RoleBrief`。
 
-```text
-LLM2Swarm/
-├── main.py                               # mock / headless 入口
-├── config.py                             # 全局配置
-├── requirements.txt
-├── controllers/
-│   ├── base_controller.py                # 控制器抽象接口
-│   ├── mock_controller.py                # 纯 Python mock 控制器
-│   ├── webots_controller.py              # Webots 飞控状态机 + 常驻 step 循环
-│   ├── llm2swarm_single/
-│   │   └── llm2swarm_single.py           # 单机 Webots demo controller
-│   └── llm2swarm_multi/
-│       └── llm2swarm_multi.py            # 多机 Webots demo controller
-├── memory/
-│   ├── pool.py                           # 进程内共享状态池
-│   └── sqlite_pool.py                    # 多进程 Webots 共享状态池
-├── operators/
-│   ├── global_operator.py                # 云端全局规划
-│   ├── vlm_agent.py                      # 边端视觉决策
-│   └── drone_lifecycle.py                # 单机生命周期控制循环
-├── models/
-│   └── schemas.py                        # Pydantic schema
-├── utils/
-│   ├── image_utils.py                    # 图像编码
-│   └── visualizer.py                     # mock 运行时可视化
-├── worlds/
-│   ├── mavic_2_pro_llm_demo.wbt          # 单机 Webots demo
-│   └── mavic_2_pro_swarm_demo.wbt        # 多机 Webots demo
-├── scripts/
-│   ├── start_tunnel.sh                   # SSH tunnel 启动脚本
-│   ├── run_webots_single_demo.sh         # 单机 Webots 启动脚本
-│   ├── prepare_webots_swarm_plan.py      # 多机云端初始化脚本
-│   ├── run_webots_swarm_demo.sh          # 多机 Webots 启动脚本
-│   ├── benchmark_thinking.py
-│   └── test_concurrent_vlm.py
-└── tests/
-    ├── test_phase1.py
-    ├── test_phase2.py
-    └── test_phase3.py
+3. `Onboard planning layer`
+机载 planner 把 `RoleBrief` 转成 `TaskGraphSpec`。
+
+4. `Runtime layer`
+任务图 runtime、memory pool、claim / event、能力校验。
+
+5. `Execution layer`
+具体 primitive 和控制器实现，例如 `mock` / `Webots`。
+
+## 核心数据契约
+
+这些结构定义在 [models/schemas.py](/Users/hyb/LocalProj/LLM2Swarm/models/schemas.py)。
+
+### 1. `RoleBrief`
+
+云端给单个 agent 的职责说明。
+
+它现在是通用结构，不绑定“搜索任务”，重点描述：
+
+- `mission_role`
+- `mission_intent`
+- `responsibilities`
+- `constraints`
+- `coordination_contracts`
+- `capability_requirements`
+- `capability_exclusions`
+- `resource_requirements`
+- `resource_permissions`
+- `success_criteria`
+- `handoff_conditions`
+- `event_watchlist`
+- `shared_context`
+- `initial_hints`
+- `metadata`
+
+它**不应该**直接等于 action list。
+
+### 2. `AgentProfile`
+
+当前 agent 的能力画像。
+
+它描述的是：
+
+- `agent_id`
+- `agent_kind`
+- `available_primitives`
+- `available_capabilities`
+- `available_resources`
+- `hard_constraints`
+- `metadata`
+
+这层是后续支持“无人机 + 地面机器人 + 载荷 agent”的关键接口。
+
+### 3. `TaskGraphSpec`
+
+机载 planner 生成的初始任务图。
+
+它描述的是：
+
+- `graph_id`
+- `summary`
+- `nodes`
+- `edges`
+- `entry_node_id`
+- `required_capabilities`
+- `required_resources`
+- `metadata`
+
+其中 `TaskGraphNode` 可以带：
+
+- `action`
+- `required_capabilities`
+- `required_resources`
+
+所以任务图不仅有动作，还有能力约束。
+
+### 4. `TaskGraphPatch`
+
+运行时对任务图做的增量 patch。
+
+目前主要支持：
+
+- `prepend_nodes`
+- `prepend_edges`
+- `reason`
+- `metadata`
+
+### 5. `VLMDecision`
+
+机载视觉 / 本地模型每个 tick 返回：
+
+```json
+{ "decision": "continue" }
 ```
 
-## 环境要求
+或者：
 
-- macOS 或 Linux
-- Python 3.11+
-- conda 环境 `llm2swarm`
-- 远端 Ollama 服务
-- 可访问的 qwen 模型
-- SSH 到远端 Ollama 机器的权限
-
-推荐安装步骤：
-
-```bash
-git clone https://github.com/Huayuanbi/LLM2Swarm.git
-cd LLM2Swarm
-
-conda create -n llm2swarm python=3.11 -y
-conda activate llm2swarm
-pip install -r requirements.txt
+```json
+{
+  "decision": "modify",
+  "new_task": "inspect anomaly",
+  "new_action": {
+    "action": "hover",
+    "params": { "duration": 2.0 }
+  },
+  "task_graph_patch": {
+    "reason": "insert short inspection step",
+    "prepend_nodes": [],
+    "prepend_edges": []
+  },
+  "event": {
+    "type": "target_detected",
+    "source": "vlm",
+    "priority": 2,
+    "payload": {}
+  },
+  "memory_update": "possible anomaly observed"
+}
 ```
 
-## 配置
+## 关键可修改组件
 
-先复制环境变量模板：
+这一节是后续改模型、改 agent、改 primitive 时最重要的接口说明。
 
-```bash
-cp .env.example .env
+### 1. 云端角色规划器
+
+文件：
+
+- [operators/global_operator.py](/Users/hyb/LocalProj/LLM2Swarm/operators/global_operator.py)
+
+核心接口：
+
+```python
+await GlobalOperator.assign_roles(
+    mission_description: str,
+    initial_states: dict[str, DroneState | dict] | None = None,
+    agent_profiles: dict[str, AgentProfile | dict] | None = None,
+) -> GlobalRolePlan
 ```
 
-典型 `.env` 配置如下：
+职责：
 
-```env
-OPENAI_API_KEY=sk-...
+- 接收抽象 mission
+- 接收初始状态
+- 接收各 agent 的能力画像
+- 输出每个 agent 的 `RoleBrief`
 
-SIMULATOR_BACKEND=mock
-LOG_LEVEL=INFO
+后续可改进方向：
 
-# Edge VLM
-EDGE_VLM_BASE_URL=http://localhost:11435/v1
+- 换更强的 LLM
+- 换 agent framework
+- 强化 role allocation prompt
+- 接入地图、地形、外部数据库
 
-# Global planner
-GLOBAL_LLM_BASE_URL=http://localhost:11435/v1
-GLOBAL_LLM_API_KEY=ollama
-GLOBAL_LLM_MODEL=qwen3.5:9b
+**重要约束**：
+只要输出仍然是 `GlobalRolePlan`，下游基本不用改。
 
-NO_PROXY=localhost,127.0.0.1
-no_proxy=localhost,127.0.0.1
+### 2. 机载初始任务图生成器
+
+文件：
+
+- [operators/onboard_planner.py](/Users/hyb/LocalProj/LLM2Swarm/operators/onboard_planner.py)
+
+核心接口：
+
+```python
+await OnboardPlannerAgent.build_initial_task_graph(
+    context: OnboardPlanningContext
+) -> OnboardPlanningResponse
 ```
 
-说明：
+输入包含：
 
-- `EDGE_VLM_BASE_URL` 是边端 VLM 的入口，通常通过 SSH tunnel 映射到本地
-- `GLOBAL_LLM_*` 控制初始任务规划器
-- 若远端 GPU 容量较紧，建议把 `GLOBAL_LLM_MODEL` 调成 `qwen3.5:4b`，联调时会更稳
-- 若不想让云端规划参与，可以清空 `GLOBAL_LLM_BASE_URL` 和 `OPENAI_API_KEY`
+- `RoleBrief`
+- `AgentProfile`
+- `self_state`
+- `peer_states`
+- `active_claims`
+- `active_events`
+- `available_primitives`
+- `available_capabilities`
 
-## SSH Tunnel
+输出是：
 
-先启动通往远端 Ollama 的 tunnel：
+- `TaskGraphSpec`
+- `planner_notes`
+- `memory_update`
 
-```bash
-./scripts/start_tunnel.sh
+后续可改进方向：
+
+- 从单次模型调用升级为多步 agent planner
+- 引入外部工具、地图工具、检索工具
+- 生成更丰富的 `TaskGraphSpec`
+- 从“只返回 primitive 节点”升级为更复杂的 graph 节点
+
+**重要约束**：
+只要仍然输出 `OnboardPlanningResponse`，runtime 不需要跟着重写。
+
+### 3. 机载 VLM / 运行时重规划器
+
+文件：
+
+- [operators/vlm_agent.py](/Users/hyb/LocalProj/LLM2Swarm/operators/vlm_agent.py)
+
+核心接口：
+
+```python
+await VLMAgent.decide(
+    drone_id: str,
+    position: tuple[float, float, float],
+    velocity: tuple[float, float, float],
+    status: str,
+    current_task: str | None,
+    image_b64: str,
+    peer_states: dict[str, DroneState],
+    claims: list[TaskClaim] | None = None,
+    events: list[TaskEvent] | None = None,
+    available_primitives: list[PrimitiveSpec] | None = None,
+    available_capabilities: list[str] | None = None,
+) -> VLMDecision
 ```
 
-查看状态：
+职责：
 
-```bash
-./scripts/start_tunnel.sh --status
+- 每个 tick 看图像和上下文
+- 决定 `continue` 或 `modify`
+- 可附带 `event`
+- 可附带 `task_graph_patch`
+
+后续可改进方向：
+
+- 换更强 VLM
+- 换 agentic VLM
+- 引入多步观察与工具调用
+- 更稳定地产出结构化 patch / event
+
+**重要约束**：
+只要仍然返回 `VLMDecision`，`DroneLifecycle` 不需要改。
+
+### 4. 任务图 runtime
+
+文件：
+
+- [operators/local_planner.py](/Users/hyb/LocalProj/LLM2Swarm/operators/local_planner.py)
+
+核心入口：
+
+```python
+build_task_graph_runtime(
+    drone_id: str,
+    role_brief: RoleBrief,
+    graph_spec: TaskGraphSpec,
+    agent_profile: AgentProfile | None = None,
+) -> LocalTaskGraph
 ```
 
-停止：
+职责：
 
-```bash
-./scripts/start_tunnel.sh --kill
+- 线性化当前任务图
+- 应用 `task_graph_patch`
+- 接受 `VLMModify`
+- 记录事件
+- 校验图是否满足当前 agent 能力约束
+
+当前限制：
+
+- runtime 还主要走“线性 primitive 执行”
+- 对 `TaskGraphEdge` 的支持仍偏轻量
+- 更复杂的 `decision / wait_event / claim / terminal` 节点语义后续还可继续增强
+
+### 5. Primitive registry / capability registry
+
+文件：
+
+- [primitives/registry.py](/Users/hyb/LocalProj/LLM2Swarm/primitives/registry.py)
+
+这是现在最关键的扩展点之一。
+
+它统一管理：
+
+- primitive 名称
+- handler 名称
+- 参数 schema
+- capability tags
+- resource tags
+- continuous 语义
+
+核心函数：
+
+```python
+list_registered_primitives()
+get_primitive_spec(name)
+register_primitive(spec)
+build_agent_profile(...)
 ```
 
-如果你的网络环境使用了本地代理，确保 `localhost` 被 `NO_PROXY` 排除。
+后续如果你提升模型能力，这层不用动；但如果你新增 agent 动作，这层通常要动。
 
-## 运行方式
+### 6. 控制器后端
 
-### 1. Mock 模式
+文件：
 
-这是最适合快速验证主逻辑的入口：
+- [controllers/base_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/base_controller.py)
+- [controllers/mock_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/mock_controller.py)
+- [controllers/webots_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/webots_controller.py)
+
+当前 controller 负责：
+
+- 连接 simulator / backend
+- 读位置、速度、相机
+- 执行 primitive
+- 暴露自己的 `AgentProfile`
+
+现在 `execute_action()` 已经从 registry 读 primitive，而不是手写固定 dispatch。
+
+## 更新模型能力时，需要遵守什么接口
+
+这是后续把普通 `llm/vlm` 换成更强 agent framework 时最重要的部分。
+
+### 1. 升级云端角色规划模型
+
+保持不变的接口：
+
+- 输入：`mission + initial_states + agent_profiles`
+- 输出：`GlobalRolePlan`
+
+你可以换：
+
+- 更强 LLM
+- planner agent
+- 外部工具链
+
+但只要保留 `assign_roles()` 这个 contract，下游不需要重构。
+
+### 2. 升级机载 planner
+
+保持不变的接口：
+
+- 输入：`OnboardPlanningContext`
+- 输出：`OnboardPlanningResponse`
+
+你可以换：
+
+- 更强本地模型
+- 多步 agent
+- 带检索/地图工具的 agent planner
+
+只要输出仍是 `TaskGraphSpec`，runtime 还是能承接。
+
+### 3. 升级 VLM / 运行时本地智能
+
+保持不变的接口：
+
+- 输入：当前观测 + 当前共享上下文 + 当前能力约束
+- 输出：`VLMDecision`
+
+你可以让模型更聪明，但不建议改掉这个数据契约。
+
+## 添加新的无人机动作，应该改哪里
+
+这是最常用的扩展路径。
+
+### 标准步骤
+
+1. 在 [primitives/registry.py](/Users/hyb/LocalProj/LLM2Swarm/primitives/registry.py) 注册新的 `PrimitiveSpec`
+
+这里定义：
+
+- primitive 名称
+- handler 名称
+- 参数
+- capability tags
+- resource tags
+- 是否 continuous
+
+2. 在相应 controller backend 里实现 handler
+
+例如：
+
+- [controllers/mock_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/mock_controller.py)
+- [controllers/webots_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/webots_controller.py)
+
+如果只有某一类 agent 支持这个动作，只在对应 backend / subclass 实现即可。
+
+3. 如果这个动作代表新的能力或资源，确保 `PrimitiveSpec` 的 `capability_tags / resource_tags` 写对
+
+这样 `AgentProfile`、云端角色分配、机载 planner、VLM prompt 都会自动看到这项能力。
+
+4. 如果还在使用旧的 `plan_mission()` 兼容路径，再补 legacy schema
+
+也就是：
+
+- [models/schemas.py](/Users/hyb/LocalProj/LLM2Swarm/models/schemas.py) 里的老 `TaskAction`
+- [operators/global_operator.py](/Users/hyb/LocalProj/LLM2Swarm/operators/global_operator.py) 里的旧 action-list prompt
+
+但这条路径现在是兼容层，不是主路径。
+
+5. 补测试
+
+至少建议补：
+
+- controller 执行测试
+- registry surface test
+- runtime 接受/拒绝能力约束测试
+
+### 现在这套方式为什么比以前更好
+
+因为现在新增动作时，不需要再同时手改：
+
+- controller dispatch 表
+- onboard planner 的 primitive 列表
+- VLM prompt 的 primitive 列表
+
+这些都已经改成从 registry 读取。
+
+## 运行模式
+
+当前仓库支持三种运行形态：
+
+- `mock`
+- `Webots` 单机 demo
+- `Webots` 多机 demo
+
+### 1. Mock
 
 ```bash
 conda activate llm2swarm
 python main.py
 ```
 
-带可视化：
-
-```bash
-python main.py --visualize
-```
-
-自定义任务：
-
-```bash
-python main.py --mission "Drone 1 patrol sector A, Drone 2 standby at base"
-```
-
-### 2. 单机 Webots Demo
-
-这是当前最推荐的 Webots 调试入口，已经打通了 `camera -> VLM -> action` 闭环。
-
-启动方法：
+### 2. 单机 Webots demo
 
 ```bash
 ./scripts/start_tunnel.sh
 ./scripts/run_webots_single_demo.sh
 ```
 
-它会打开：
+当前单机路径已经打通：
 
-- `worlds/mavic_2_pro_llm_demo.wbt`
+- `camera -> VLM -> action`
+- `RoleBrief -> OnboardPlanner -> TaskGraph`
 
-其中使用的 Webots controller 是：
-
-- `controllers/llm2swarm_single/llm2swarm_single.py`
-
-启动逻辑：
-
-1. 先尝试用 `GlobalOperator` 生成初始 action list
-2. 若失败则退回内置任务
-3. 启动 `DroneLifecycle`
-4. 在动作执行过程中周期性调用 `VLMAgent`
-5. VLM 根据 camera 图像返回 `continue` 或 `modify`
-
-### 3. 多机 Webots Demo
-
-多机版本现在采用“云端先初始化，全局平等下发”的方式。
-
-启动方法：
+### 3. 多机 Webots demo
 
 ```bash
 ./scripts/start_tunnel.sh
 ./scripts/run_webots_swarm_demo.sh
 ```
 
-它会先执行：
+这条路径会先运行：
 
-```bash
-python scripts/prepare_webots_swarm_plan.py
+- [scripts/prepare_webots_swarm_plan.py](/Users/hyb/LocalProj/LLM2Swarm/scripts/prepare_webots_swarm_plan.py)
+
+它会：
+
+- 初始化 SQLite 共享 memory
+- 收集 `initial_states`
+- 收集 `agent_profiles`
+- 调云端 `assign_roles()`
+- 写入 per-agent `RoleBrief`
+
+然后 Webots 中每个 controller 进程再各自：
+
+- 读取自己的 `RoleBrief`
+- 调 `OnboardPlannerAgent`
+- 得到初始 `TaskGraph`
+- 启动 `DroneLifecycle`
+
+## 环境变量
+
+最常用的是：
+
+```env
+SIMULATOR_BACKEND=mock
+LOG_LEVEL=INFO
+
+EDGE_VLM_BASE_URL=http://localhost:11435/v1
+
+GLOBAL_LLM_BASE_URL=http://localhost:11435/v1
+GLOBAL_LLM_MODEL=qwen3.5:4b
+
+ONBOARD_PLANNER_BASE_URL=http://localhost:11435/v1
+ONBOARD_PLANNER_MODEL=qwen3.5:4b
 ```
 
-也就是：
+Webots 多机初始化额外支持：
 
-- 先重置共享 SQLite 状态库
-- 云端统一生成完整 `drone_id -> action list`
-- 将全局计划写入共享存储
-
-然后再打开：
-
-- `worlds/mavic_2_pro_swarm_demo.wbt`
-
-这个 world 中每架 `Mavic2Pro` 都运行：
-
-- `controllers/llm2swarm_multi/llm2swarm_multi.py`
-
-为了方便观察，多机 world 还给三架无人机分别挂了醒目的彩色 marker：
-
-- `drone_1`：红色
-- `drone_2`：绿色
-- `drone_3`：蓝色
-
-每架无人机启动后只做这几件事：
-
-1. 从共享 SQLite 读取属于自己的初始任务
-2. 启动自己的 `WebotsController`
-3. 启动自己的 `DroneLifecycle`
-4. 周期性执行自己的 VLM tick
-5. 将自身状态写回 SQLite，供其他无人机读取
-
-共享状态文件默认是：
-
-- `/tmp/llm2swarm_webots_swarm.sqlite3`
-
-## Webots 控制逻辑
-
-`WebotsController` 当前不是简单的“发命令即返回”，而是一个常驻飞控状态机：
-
-- 内部维护后台线程
-- 独占 `robot.step()`
-- 每个 step 读取 `camera / gps / imu / gyro`
-- 将最近一帧 camera 缓存为 Base64 JPEG
-- 根据当前 mode 计算四个电机转速
-
-高层 action 只做“设定目标 + 等待完成”，而不是直接控制电机。
-
-当前已实现的动作：
-
-- `takeoff`
-- `go_to_waypoint`
-- `hover`
-- `search_pattern`
-- `land`
+- `WEBOTS_SWARM_DRONES`
+- `WEBOTS_SWARM_DB`
+- `WEBOTS_SWARM_WORLD_FILE`
+- `WEBOTS_SWARM_INITIAL_STATES`
+- `WEBOTS_SWARM_AGENT_PROFILES`
 
 其中：
 
-- `search_pattern` 是持续动作，不会自己结束
-- 默认会沿内部圆周航点持续循环
-- 需要 VLM 返回 `modify` 才会切换到新任务
-
-## VLM 输入与输出
-
-每个 VLM tick 会发送：
-
-- 当前机载 camera 图像
-- 当前位姿和速度
-- 当前任务
-- 队友状态摘要
-
-VLM 返回两种 JSON 之一：
-
-```json
-{ "decision": "continue" }
-```
-
-或
-
-```json
-{
-  "decision": "modify",
-  "new_task": "avoid obstacle ahead",
-  "new_action": {
-    "action": "go_to_waypoint",
-    "params": { "x": 5, "y": 5, "z": 10, "velocity": 3 }
-  },
-  "memory_update": "obstacle detected near windmill"
-}
-```
-
-如果 VLM 超时或输出非法 JSON，系统会自动回退为 `continue`。
+- `WEBOTS_SWARM_INITIAL_STATES` 用于显式注入初始状态
+- `WEBOTS_SWARM_AGENT_PROFILES` 用于显式注入 agent profile
+- 如果没提供，demo 脚本会做合理 fallback
 
 ## 测试
 
-项目自带三阶段测试，主要覆盖 mock 路径：
+运行：
 
 ```bash
 conda activate llm2swarm
-
 python tests/test_phase1.py
 python tests/test_phase2.py
 python tests/test_phase3.py
 ```
 
-目前测试特点：
+当前测试覆盖：
 
-- `Phase 1` 纯离线，稳定可跑
-- `Phase 2` 的在线规划测试依赖可访问的模型接口
-- `Phase 3` 的 live VLM 依赖 SSH tunnel
-- Webots 单机与多机 demo 需要在真实 Webots GUI 中观察，不包含在这三组自动化测试里
+- `Phase 1`
+  - controller 基础能力
+  - registry surface
+  - schema 基础解析
 
-## 当前推荐的调试顺序
+- `Phase 2`
+  - memory / claim / event
+  - `RoleBrief` 兼容映射
+  - `AgentProfile` 基础推导
+  - `GlobalOperator.assign_roles()` prompt contract
+  - `OnboardPlannerAgent` prompt contract
 
-如果你是第一次接触这个仓库，建议按这个顺序跑：
+- `Phase 3`
+  - lifecycle
+  - task graph runtime
+  - VLM modify / event
+  - claim / event 流
+  - capability-aware runtime validation
 
-1. `python tests/test_phase1.py`
-2. `./scripts/start_tunnel.sh --status`
-3. `python main.py`
-4. `./scripts/run_webots_single_demo.sh`
-5. `./scripts/run_webots_swarm_demo.sh`
+这些测试更偏“框架 contract / runtime 回归”，不是对真实模型效果的最终评估。
 
-这样最容易定位问题到底是在：
+## 当前仍然存在的限制
 
-- Python 环境
-- 模型连通性
-- 生命周期逻辑
-- 单机 Webots 飞控
-- 还是多机协同
+- Webots demo 目前仍然只实现了一小组 primitive
+- `TaskGraph` runtime 还偏线性执行，不是完整的通用 graph engine
+- demo fallback 里仍然有 `bootstrap_actions` 样例，这部分属于示例数据，不是框架核心
+- Webots 端到端联调仍然需要人工观察 GUI
 
-## 设计说明与限制
+## TODO
 
-### 为什么先做 direct controller
+后续改进项单独整理在：
 
-当前 Webots demo 先采用 direct controller，是因为它更适合把以下链路快速打通：
+- [TODO.md](/Users/hyb/LocalProj/LLM2Swarm/TODO.md)
 
-- 飞控
-- 相机
-- VLM 调用
-- 动作执行
+## 一句话总结
 
-单机路径已经验证成功后，再回到更复杂的 extern-controller 组织方式会更稳。
+这个仓库现在的核心不是“让云端替每架无人机把动作写死”，而是提供一套可扩展接口：
 
-### 多机为什么要用 SQLite
+`抽象任务 -> 云端角色分配 -> 机载任务图生成 -> 运行时视觉/事件重规划 -> primitive 执行`
 
-在 Webots 多机 direct controller 模式下，每架无人机都是独立 controller 进程，所以不能再用进程内的 `SharedMemoryPool`。因此多机 demo 使用：
-
-- `memory/sqlite_pool.py`
-
-来共享：
-
-- 位置
-- 速度
-- 状态
-- 观察
-- 初始任务
-
-## 后续建议
-
-如果你准备继续推进这个项目，最值得优先做的是：
-
-- 调整 global plan prompt，让初始 waypoint 更符合场景
-- 优化 `search_pattern` 的退出条件
-- 为多机 Webots 增加更明确的碰撞规避动作
-- 给多机 demo 加日志面板或状态可视化
+后续无论你换更强模型、换 agent framework、加新 agent 类型、加新 primitive，优先都应该沿着这套 contract 扩展，而不是回到写死某个场景逻辑。

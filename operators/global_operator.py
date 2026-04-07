@@ -19,12 +19,13 @@ import asyncio
 import json
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 from openai import AsyncOpenAI
 
 import config
-from models.schemas import GlobalPlan
+from models.schemas import AgentProfile, DroneState, GlobalPlan, GlobalRolePlan
+from primitives.registry import format_primitives_for_prompt, list_registered_primitives
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ RETRY_BASE_DELAY = 2.0   # seconds; doubles each attempt
 
 # ─── System prompt ────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT = f"""\
 You are the Global Mission Planner for an autonomous multi-drone swarm system.
 
 Your job is to translate a natural-language mission into a structured JSON task plan.
@@ -42,21 +43,17 @@ Your job is to translate a natural-language mission into a structured JSON task 
 OUTPUT FORMAT — you must return ONLY valid JSON with no markdown, no code fences,
 no commentary. The structure is:
 
-{
+{{
   "drone_1": [
-    {"action": "<skill_name>", "params": {<param_key>: <value>, ...}},
+    {{"action": "<skill_name>", "params": {{<param_key>: <value>, ...}}}},
     ...
   ],
   "drone_2": [...],
   ...
-}
+}}
 
 AVAILABLE SKILLS and their required params:
-  takeoff          → {"altitude": <float, metres>}
-  go_to_waypoint   → {"x": <float>, "y": <float>, "z": <float>, "velocity": <float, m/s>}
-  hover            → {"duration": <float, seconds>}
-  search_pattern   → {"center_x": <float>, "center_y": <float>, "radius": <float>, "altitude": <float>}
-  land             → {}
+{format_primitives_for_prompt(list_registered_primitives())}
 
 RULES:
   1. Every drone must begin its task list with a takeoff action.
@@ -66,6 +63,56 @@ RULES:
      (center_x, center_y, altitude) so the drone explicitly flies to the
      search area first — do not assume it is already there.
   5. Return ONLY the JSON object — nothing else.
+"""
+
+_ROLE_SYSTEM_PROMPT = """\
+You are the Cloud Mission Planner for an autonomous multi-drone swarm system.
+
+Your job is to translate a coarse natural-language mission into per-drone role
+briefs. You may use each drone's initial state (position, battery, status) to
+decide how to split responsibility.
+
+OUTPUT FORMAT — return ONLY valid JSON with no markdown, no code fences,
+no commentary. The structure is:
+
+{
+  "drone_1": {
+    "mission_role": "<short role name>",
+    "mission_intent": "<why this agent exists in the mission>",
+    "responsibilities": ["<responsibility>", "..."],
+    "constraints": ["<hard rule or exclusion>", "..."],
+    "coordination_contracts": ["<peer coordination rule>", "..."],
+    "capability_requirements": ["<desired capability>", "..."],
+    "capability_exclusions": ["<capability this role should avoid depending on>", "..."],
+    "resource_requirements": ["<resource or payload that should exist>", "..."],
+    "resource_permissions": ["<resource this role may use>", "..."],
+    "success_criteria": ["<what counts as success>", "..."],
+    "handoff_conditions": ["<when to escalate, reassign, or hand off>", "..."],
+    "event_watchlist": ["<important event type>", "..."],
+    "shared_context": {
+      "<context_key>": "<context_value or nested object>"
+    },
+    "initial_hints": ["<non-binding local planning hint>", "..."],
+    "metadata": {
+      "<optional_key>": "<optional_value>"
+    }
+  },
+  "drone_2": {...}
+}
+
+RULES:
+  1. Assign a role brief only to drones listed in the mission context.
+  2. Do NOT output a full primitive action list or detailed route plan.
+  3. Keep the schema generic and reusable across different agent types and tasks.
+  4. Put mission-specific spatial or semantic details inside shared_context, not
+     in top-level task-specific fields.
+  5. Use each agent's declared capabilities/resources to decide which roles are feasible.
+  6. capability_requirements and capability_exclusions should reflect what the role
+     needs or should avoid depending on.
+  7. coordination_contracts should explicitly reduce duplicated work.
+  8. event_watchlist should mention likely important events such as battery_low,
+     peer_lost, target_detected, obstacle_detected, or region_complete when relevant.
+  9. Return ONLY the JSON object — nothing else.
 """
 
 
@@ -109,12 +156,73 @@ class GlobalOperator:
             {"role": "user",    "content": user_message},
         ]
 
+        plan = await self._run_json_planner(
+            messages=messages,
+            parser=lambda raw: _parse_plan(raw, self._drone_ids),
+            parse_target="plan",
+        )
+        logger.info(
+            "GlobalOperator: plan created for drones %s",
+            list(plan.plan.keys()),
+        )
+        return plan
+
+    async def assign_roles(
+        self,
+        mission_description: str,
+        initial_states: Optional[dict[str, DroneState | dict]] = None,
+        agent_profiles: Optional[dict[str, AgentProfile | dict]] = None,
+    ) -> GlobalRolePlan:
+        """
+        Convert a coarse mission into per-drone role briefs.
+
+        Args:
+            mission_description: Natural-language objective for the swarm.
+            initial_states: Optional per-drone initial state snapshot. These do
+                not need to be perfect; even approximate position / battery
+                helps the cloud planner produce better role allocation.
+        """
+        state_context = _build_initial_state_context(self._drone_ids, initial_states)
+        profile_context = _build_agent_profile_context(self._drone_ids, agent_profiles)
+        user_message = (
+            f"Active drones: {', '.join(self._drone_ids)}\n\n"
+            f"Initial states:\n{state_context}\n\n"
+            f"Agent profiles:\n{profile_context}\n\n"
+            f"Mission: {mission_description}"
+        )
+        messages = [
+            {"role": "system", "content": _ROLE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ]
+
+        roles = await self._run_json_planner(
+            messages=messages,
+            parser=lambda raw: _parse_role_plan(raw, self._drone_ids),
+            parse_target="role plan",
+        )
+        logger.info(
+            "GlobalOperator: role briefs created for drones %s",
+            list(roles.roles.keys()),
+        )
+        return roles
+
+    async def _run_json_planner(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        parser: Callable[[str], object],
+        parse_target: str,
+    ):
+        """
+        Shared retry + parse loop used by both action-plan and role-brief modes.
+        """
+        working_messages = list(messages)
         last_error: Optional[str] = None
+        raw_content = ""
 
         for attempt in range(1, MAX_RETRIES + 1):
-            # If a previous attempt failed, append a correction message
             if last_error:
-                messages.append({
+                working_messages.append({
                     "role": "user",
                     "content": (
                         f"Your previous response was invalid. Error: {last_error}\n"
@@ -127,38 +235,30 @@ class GlobalOperator:
                     "GlobalOperator: calling %s (attempt %d/%d)",
                     config.GLOBAL_LLM_MODEL, attempt, MAX_RETRIES,
                 )
-                # response_format=json_object is OpenAI-specific; omit for Ollama
                 extra = {}
                 if not config.GLOBAL_LLM_BASE_URL:
                     extra["response_format"] = {"type": "json_object"}
 
                 response = await self._client.chat.completions.create(
                     model=config.GLOBAL_LLM_MODEL,
-                    messages=messages,
+                    messages=working_messages,
                     temperature=0.2,
-                    timeout=120.0,  # Ollama 9b may take ~90s for a multi-drone plan
+                    timeout=120.0,
                     **extra,
                 )
 
                 raw_content = response.choices[0].message.content or ""
-                logger.debug("GlobalOperator raw response:\n%s", raw_content)
-
-                plan = _parse_plan(raw_content, self._drone_ids)
-                logger.info(
-                    "GlobalOperator: plan created for drones %s",
-                    list(plan.plan.keys()),
-                )
-                return plan
+                logger.debug("GlobalOperator raw %s response:\n%s", parse_target, raw_content)
+                return parser(raw_content)
 
             except (json.JSONDecodeError, ValueError) as e:
                 last_error = str(e)
                 logger.warning(
                     "GlobalOperator: parse error on attempt %d: %s", attempt, last_error
                 )
-                # Append the bad response so GPT-4o can see what went wrong
-                messages.append({
+                working_messages.append({
                     "role": "assistant",
-                    "content": raw_content if "raw_content" in dir() else "",
+                    "content": raw_content,
                 })
 
             except Exception as e:
@@ -171,7 +271,7 @@ class GlobalOperator:
                 await asyncio.sleep(delay)
 
         raise RuntimeError(
-            f"GlobalOperator failed to produce a valid plan after {MAX_RETRIES} "
+            f"GlobalOperator failed to produce a valid {parse_target} after {MAX_RETRIES} "
             f"attempts. Last error: {last_error}"
         )
 
@@ -210,3 +310,94 @@ def _parse_plan(raw: str, drone_ids: list[str]) -> GlobalPlan:
         )
 
     return plan
+
+
+def _parse_role_plan(raw: str, drone_ids: list[str]) -> GlobalRolePlan:
+    """
+    Parse raw LLM text into a validated GlobalRolePlan.
+    """
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned).strip()
+
+    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object found in LLM response: {cleaned!r}")
+
+    data = json.loads(match.group())
+    plan = GlobalRolePlan.model_validate(data)
+
+    missing = [did for did in drone_ids if did not in plan.roles]
+    if missing:
+        logger.warning(
+            "GlobalOperator: LLM did not assign role briefs to %s. "
+            "They will use local fallbacks.",
+            missing,
+        )
+
+    return plan
+
+
+def _build_initial_state_context(
+    drone_ids: list[str],
+    initial_states: Optional[dict[str, DroneState | dict]],
+) -> str:
+    if not initial_states:
+        return "\n".join(f"  {drone_id}: position=(unknown) battery=(unknown) status=idle" for drone_id in drone_ids)
+
+    lines = []
+    for drone_id in drone_ids:
+        raw = initial_states.get(drone_id) if initial_states else None
+        state = raw if isinstance(raw, DroneState) else None
+        if state is None and isinstance(raw, dict):
+            try:
+                state = DroneState.model_validate({"drone_id": drone_id, **raw})
+            except Exception:
+                state = None
+
+        if state is None:
+            lines.append(f"  {drone_id}: position=(unknown) battery=(unknown) status=idle")
+            continue
+
+        px, py, pz = state.position
+        battery = "unknown" if state.battery_level is None else f"{state.battery_level:.2f}"
+        lines.append(
+            f"  {drone_id}: position=({px:.1f},{py:.1f},{pz:.1f}) "
+            f"battery={battery} status={state.status}"
+        )
+    return "\n".join(lines)
+
+
+def _build_agent_profile_context(
+    drone_ids: list[str],
+    agent_profiles: Optional[dict[str, AgentProfile | dict]],
+) -> str:
+    if not agent_profiles:
+        return "\n".join(
+            f"  {drone_id}: kind=(unknown) capabilities=(unknown) primitives=(unknown) resources=(unknown)"
+            for drone_id in drone_ids
+        )
+
+    lines = []
+    for drone_id in drone_ids:
+        raw = agent_profiles.get(drone_id) if agent_profiles else None
+        profile = raw if isinstance(raw, AgentProfile) else None
+        if profile is None and isinstance(raw, dict):
+            try:
+                profile = AgentProfile.model_validate({"agent_id": drone_id, **raw})
+            except Exception:
+                profile = None
+
+        if profile is None:
+            lines.append(
+                f"  {drone_id}: kind=(unknown) capabilities=(unknown) primitives=(unknown) resources=(unknown)"
+            )
+            continue
+
+        primitive_names = [primitive.name for primitive in profile.available_primitives]
+        lines.append(
+            f"  {drone_id}: kind={profile.agent_kind} "
+            f"capabilities={profile.available_capabilities or ['(none)']} "
+            f"primitives={primitive_names or ['(none)']} "
+            f"resources={profile.available_resources or ['(none)']}"
+        )
+    return "\n".join(lines)

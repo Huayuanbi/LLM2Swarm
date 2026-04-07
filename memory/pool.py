@@ -17,13 +17,16 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import time
+from collections import deque
 from typing import Optional
 
-from models.schemas import DroneState
+from models.schemas import DroneState, TaskClaim, TaskEvent
 
 logger = logging.getLogger(__name__)
 
 MAX_OBSERVATIONS = 20   # keep only the N most recent observations per drone
+MAX_EVENTS       = 50   # keep only the N most recent shared swarm events
 
 
 class SharedMemoryPool:
@@ -42,6 +45,8 @@ class SharedMemoryPool:
         self._store: dict[str, DroneState] = {
             did: DroneState(drone_id=did) for did in drone_ids
         }
+        self._claims: dict[tuple[str, str], TaskClaim] = {}
+        self._events: deque[TaskEvent] = deque(maxlen=MAX_EVENTS)
         logger.info("SharedMemoryPool initialised for drones: %s", drone_ids)
 
     # ── Reads ──────────────────────────────────────────────────────────────────
@@ -64,6 +69,17 @@ class SharedMemoryPool:
         all_states = await self.get_all_states()
         return {did: s for did, s in all_states.items() if did != exclude_drone_id}
 
+    async def get_claims(self) -> list[TaskClaim]:
+        """Return the active, non-expired claim leases."""
+        async with self._lock:
+            self._prune_expired_claims_locked()
+            return copy.deepcopy(list(self._claims.values()))
+
+    async def get_events(self) -> list[TaskEvent]:
+        """Return the recent shared swarm events."""
+        async with self._lock:
+            return copy.deepcopy(list(self._events))
+
     # ── Writes ─────────────────────────────────────────────────────────────────
 
     async def update_drone(
@@ -72,6 +88,7 @@ class SharedMemoryPool:
         *,
         position: Optional[list[float]]  = None,
         velocity: Optional[list[float]]  = None,
+        battery_level: Optional[float]   = None,
         status: Optional[str]            = None,
         current_task: Optional[str]      = None,
         add_observation: Optional[str]   = None,
@@ -98,6 +115,8 @@ class SharedMemoryPool:
                 state.position = position
             if velocity is not None:
                 state.velocity = velocity
+            if battery_level is not None:
+                state.battery_level = battery_level
             if status is not None:
                 state.status = status
             if current_task is not None:
@@ -107,13 +126,79 @@ class SharedMemoryPool:
                 # Trim to cap
                 if len(state.observations) > MAX_OBSERVATIONS:
                     state.observations = state.observations[-MAX_OBSERVATIONS:]
+            state.updated_at = time.time()
 
         logger.debug(
-            "[%s] Memory updated — status=%s pos=%s obs=%s",
-            drone_id, status, position, add_observation,
+            "[%s] Memory updated — status=%s pos=%s battery=%s obs=%s",
+            drone_id, status, position, battery_level, add_observation,
         )
 
     async def clear_observations(self, drone_id: str) -> None:
         """Wipe the observation log for a drone (e.g. after a VLM replanning tick)."""
         async with self._lock:
             self._store[drone_id].observations = []
+
+    async def emit_event(self, event: TaskEvent) -> None:
+        """Append a structured swarm event to the shared event stream."""
+        async with self._lock:
+            self._events.append(event)
+
+    async def acquire_claim(
+        self,
+        *,
+        claim_type: str,
+        target_key: str,
+        claimant_id: str,
+        ttl: float,
+        payload: Optional[dict] = None,
+    ) -> bool:
+        """
+        Try to acquire a time-limited claim lease for a shared swarm resource.
+
+        Returns True only if the claim was free/expired or already owned by the
+        same claimant. This is the primitive used for takeover coordination.
+        """
+        expires_at = time.time() + ttl
+        key = (claim_type, target_key)
+        async with self._lock:
+            self._prune_expired_claims_locked()
+            existing = self._claims.get(key)
+            if existing and existing.claimant_id != claimant_id:
+                return False
+
+            self._claims[key] = TaskClaim(
+                claim_type=claim_type,
+                target_key=target_key,
+                claimant_id=claimant_id,
+                payload=payload or {},
+                expires_at=expires_at,
+            )
+            return True
+
+    async def release_claim(
+        self,
+        *,
+        claim_type: str,
+        target_key: str,
+        claimant_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Release a claim if it exists and is either unowned-filtered or owned by
+        the provided claimant_id.
+        """
+        key = (claim_type, target_key)
+        async with self._lock:
+            self._prune_expired_claims_locked()
+            existing = self._claims.get(key)
+            if existing is None:
+                return False
+            if claimant_id is not None and existing.claimant_id != claimant_id:
+                return False
+            self._claims.pop(key, None)
+            return True
+
+    def _prune_expired_claims_locked(self) -> None:
+        now = time.time()
+        expired = [key for key, claim in self._claims.items() if claim.expires_at <= now]
+        for key in expired:
+            self._claims.pop(key, None)

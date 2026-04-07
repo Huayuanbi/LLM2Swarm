@@ -23,6 +23,7 @@ from controllers.mock_controller import MockDroneController
 from models.schemas import (
     DroneState, GlobalPlan, VLMContinue, VLMModify, parse_vlm_decision
 )
+from primitives.registry import get_primitive_spec
 from utils.image_utils import build_image_message, describe_image_mock
 
 
@@ -192,6 +193,25 @@ def test_schemas():
     print("✓ test_schemas")
 
 
+# ─── Test 9: primitive registry metadata is exposed by controllers ───────────
+
+def test_primitive_registry_surface():
+    ctrl = make_controller("drone_1")
+    names = ctrl.get_available_primitive_names()
+    assert "takeoff" in names
+    assert "go_to_waypoint" in names
+    assert "search_pattern" in names
+
+    capabilities = ctrl.get_capability_tags()
+    assert "flight" in capabilities
+    assert "navigation" in capabilities
+
+    spec = get_primitive_spec("go_to_waypoint")
+    assert spec.handler_name == "go_to_waypoint"
+    assert any(param.name == "x" for param in spec.parameters)
+    print("✓ test_primitive_registry_surface")
+
+
 # ─── Runner ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -204,6 +224,7 @@ if __name__ == "__main__":
         test_hover,
         test_execute_action,
         test_schemas,
+        test_primitive_registry_surface,
     ]
     passed = 0
     failed = 0

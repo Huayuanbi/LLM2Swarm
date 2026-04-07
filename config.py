@@ -15,6 +15,8 @@ DRONE_IDS: list[str] = ["drone_1", "drone_2", "drone_3"]
 CONTROL_LOOP_INTERVAL: float = 10.0   # seconds between perception/replanning ticks
 VLM_TIMEOUT: float           = 20.0   # max seconds to wait for edge VLM response (multimodal ~10s for 4b)
 VLM_FALLBACK_DECISION: str   = "continue"  # used if VLM times out or errors
+PEER_LOST_TIMEOUT: float     = float(os.getenv("PEER_LOST_TIMEOUT", "35.0"))
+CLAIM_LEASE_TTL: float       = float(os.getenv("CLAIM_LEASE_TTL", "90.0"))
 
 # ─── Cloud LLM (Global Planner) ───────────────────────────────────────────────
 # To use GPT-4o:   GLOBAL_LLM_BASE_URL="" (or unset),  GLOBAL_LLM_MODEL="gpt-4o"
@@ -32,6 +34,15 @@ EDGE_VLM_BASE_URL: str = os.getenv("EDGE_VLM_BASE_URL", "http://10.130.138.37:11
 EDGE_VLM_API_KEY: str  = "ollama"          # Ollama ignores this but OpenAI client requires it
 EDGE_VLM_MODEL: str    = "qwen3.5:4b"
 EDGE_VLM_TEMPERATURE: float = 0.0
+
+# ─── Onboard Planner (initial task-graph synthesis / future agent adapter) ──
+# Defaults to the same local/edge model route, but can later be redirected to a
+# stronger LLM or a dedicated agent framework without changing call sites.
+ONBOARD_PLANNER_BASE_URL: str = os.getenv("ONBOARD_PLANNER_BASE_URL", EDGE_VLM_BASE_URL)
+ONBOARD_PLANNER_API_KEY: str = os.getenv("ONBOARD_PLANNER_API_KEY", EDGE_VLM_API_KEY)
+ONBOARD_PLANNER_MODEL: str = os.getenv("ONBOARD_PLANNER_MODEL", EDGE_VLM_MODEL)
+ONBOARD_PLANNER_TEMPERATURE: float = float(os.getenv("ONBOARD_PLANNER_TEMPERATURE", "0.0"))
+ONBOARD_PLANNER_TIMEOUT: float = float(os.getenv("ONBOARD_PLANNER_TIMEOUT", "25.0"))
 
 # ─── Simulator backend ─────────────────────────────────────────────────────────
 # "mock"   — pure-Python simulated physics, no external simulator needed

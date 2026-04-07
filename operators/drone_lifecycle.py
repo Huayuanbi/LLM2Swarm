@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections import deque
 from typing import Optional, Union
@@ -33,7 +34,8 @@ from typing import Optional, Union
 import config
 from controllers.base_controller import DroneController
 from memory.pool import SharedMemoryPool
-from models.schemas import VLMContinue, VLMModify
+from models.schemas import TaskEvent, VLMContinue, VLMModify
+from operators.local_planner import LocalTaskGraph
 from operators.vlm_agent import VLMAgent
 
 logger = logging.getLogger(__name__)
@@ -81,7 +83,8 @@ class DroneLifecycle:
         controller:      DroneController,
         memory:          SharedMemoryPool,
         vlm:             VLMAgent,
-        initial_tasks:   list[dict],
+        initial_tasks:   Optional[list[dict]] = None,
+        task_graph:      Optional[LocalTaskGraph] = None,
         stop_when_empty: bool = False,
         vlm_log:         Optional[deque] = None,
         task_queues:     Optional[dict]  = None,
@@ -90,14 +93,19 @@ class DroneLifecycle:
         self._ctrl            = controller
         self._memory          = memory
         self._vlm             = vlm
-        self._queue:          deque[dict] = deque(initial_tasks)
+        self._task_graph      = task_graph
+        self._queue:          deque[dict] = deque(initial_tasks or [])
         self._running         = False
         self._tick_count      = 0
         self._stop_when_empty = stop_when_empty
         self._vlm_log         = vlm_log
         self._task_queues     = task_queues
+        self._reported_peer_loss: set[str] = set()
         # Track which action is currently mid-execution (survives across ticks)
         self._current_action: Optional[dict] = None
+
+        if self._task_graph is None and initial_tasks is None:
+            raise ValueError("DroneLifecycle requires either initial_tasks or task_graph")
 
         # Publish initial queue to the display dict
         self._sync_task_queues()
@@ -114,14 +122,14 @@ class DroneLifecycle:
         """
         self._running = True
         logger.info("[%s] Lifecycle starting. Task queue depth: %d",
-                    self.drone_id, len(self._queue))
+                    self.drone_id, self._pending_action_count())
 
         await self._memory.update_drone(self.drone_id, status="starting")
 
         try:
             while self._running:
                 # ── Empty queue ──────────────────────────────────────────────
-                if not self._queue and self._current_action is None:
+                if not self._has_pending_actions() and self._current_action is None:
                     if self._stop_when_empty:
                         logger.info("[%s] Task queue empty — exiting cleanly.", self.drone_id)
                         await self._memory.update_drone(self.drone_id, status="idle")
@@ -141,7 +149,7 @@ class DroneLifecycle:
                     await self._memory.update_drone(
                         self.drone_id,
                         status="executing",
-                        current_task=self._current_action.get("action", "unknown"),
+                        current_task=self._active_task_label(),
                     )
                     self._sync_task_queues()
 
@@ -203,6 +211,8 @@ class DroneLifecycle:
                 logger.info("[%s] Action completed: %s",
                             self.drone_id,
                             self._current_action.get("action") if self._current_action else "?")
+                if self._task_graph is not None:
+                    self._task_graph.on_action_completed(self._current_action)
                 self._current_action = None
                 self._sync_task_queues()
 
@@ -211,7 +221,7 @@ class DroneLifecycle:
                     decision = await vlm_task
                     self._tick_count += 1
                     await self._apply_decision(decision)
-                elif self._queue:
+                elif self._has_pending_actions():
                     # VLM still running but more actions are queued —
                     # cancel this VLM (a fresh one fires at the next tick start)
                     # so the drone doesn't sit idle waiting for inference.
@@ -263,12 +273,6 @@ class DroneLifecycle:
         """Signal the loop to exit cleanly after the current tick."""
         self._running = False
 
-    # ── Action helpers ─────────────────────────────────────────────────────────
-
-    def _pop_next(self) -> dict:
-        """Pop the next action from the queue."""
-        return self._queue.popleft()
-
     # ── VLM query (runs concurrently with execute) ────────────────────────────
 
     async def _query_vlm(self) -> Union[VLMContinue, VLMModify]:
@@ -289,18 +293,16 @@ class DroneLifecycle:
             velocity=list(vel),
         )
         peer_states = await self._memory.get_peer_states(self.drone_id)
+        claims = await self._get_swarm_claims()
+        await self._detect_runtime_events(peer_states)
+        events = await self._get_swarm_events()
 
         logger.info(
             "[%s] Tick %d | pos=(%.1f,%.1f,%.1f) | queue=%d | peers=%s",
             self.drone_id, self._tick_count,
             pos[0], pos[1], pos[2],
-            len(self._queue) + (1 if self._current_action else 0),
+            self._pending_action_count() + (1 if self._current_action else 0),
             {pid: s.status for pid, s in peer_states.items()},
-        )
-
-        current_label = (
-            self._current_action.get("action") if self._current_action
-            else (self._queue[0].get("action") if self._queue else "idle")
         )
 
         return await self._vlm.decide(
@@ -308,9 +310,13 @@ class DroneLifecycle:
             position     = pos,
             velocity     = vel,
             status       = "executing" if self._current_action else "idle",
-            current_task = current_label,
+            current_task = self._active_task_label(),
             image_b64    = image_b64,
             peer_states  = peer_states,
+            claims       = claims,
+            events       = events,
+            available_primitives=self._ctrl.get_available_primitive_specs(),
+            available_capabilities=self._ctrl.get_capability_tags(),
         )
 
     # ── Apply decision ────────────────────────────────────────────────────────
@@ -327,11 +333,50 @@ class DroneLifecycle:
                 self._vlm_log.append(f"  {ts}  {self.drone_id:<10}  continue")
 
         elif isinstance(decision, VLMModify):
+            if not await self._can_apply_modify(decision):
+                logger.info(
+                    "[%s] VLM MODIFY skipped because the target/event is already claimed elsewhere.",
+                    self.drone_id,
+                )
+                await self._memory.update_drone(
+                    self.drone_id,
+                    status="executing",
+                    current_task=self._active_task_label(),
+                )
+                return
+
             logger.info("[%s] VLM → MODIFY: '%s'  action=%s",
                         self.drone_id, decision.new_task, decision.new_action)
+            interrupted_action = self._current_action
             self._current_action = None
-            self._queue.appendleft(decision.new_action)
+            try:
+                if self._task_graph is not None:
+                    self._task_graph.apply_vlm_modify(
+                        decision,
+                        current_action=interrupted_action,
+                    )
+                elif decision.new_action is not None:
+                    supported = set(self._ctrl.get_available_primitive_names())
+                    action_name = decision.new_action.get("action")
+                    if action_name not in supported:
+                        raise ValueError(
+                            f"Unsupported primitive '{action_name}' for controller {self.drone_id}"
+                        )
+                    self._queue.appendleft(decision.new_action)
+            except ValueError as exc:
+                logger.warning("[%s] VLM MODIFY rejected by runtime validation: %s", self.drone_id, exc)
+                if interrupted_action is not None:
+                    self._current_action = interrupted_action
+                await self._memory.update_drone(
+                    self.drone_id,
+                    status="executing",
+                    current_task=self._active_task_label(),
+                )
+                return
             self._sync_task_queues()
+
+            if decision.event is not None:
+                await self._emit_swarm_event(decision.event)
 
             if decision.memory_update:
                 await self._memory.update_drone(
@@ -356,8 +401,137 @@ class DroneLifecycle:
         items = []
         if self._current_action:
             items.append(f"▶ {_fmt_action(self._current_action)}")
-        items.extend(_fmt_action(t) for t in self._queue)
+        items.extend(_fmt_action(t) for t in self._preview_actions())
         self._task_queues[self.drone_id] = items
+
+    def _has_pending_actions(self) -> bool:
+        if self._task_graph is not None:
+            return self._task_graph.has_pending_actions()
+        return bool(self._queue)
+
+    def _pending_action_count(self) -> int:
+        if self._task_graph is not None:
+            return self._task_graph.pending_count()
+        return len(self._queue)
+
+    def _preview_actions(self) -> list[dict]:
+        if self._task_graph is not None:
+            return self._task_graph.preview_actions()
+        return list(self._queue)
+
+    def _pop_next(self) -> dict:
+        """Pop the next action from the queue."""
+        if self._task_graph is not None:
+            return self._task_graph.pop_next_action()
+        return self._queue.popleft()
+
+    def _active_task_label(self) -> str:
+        if self._task_graph is not None:
+            return self._task_graph.current_task_label(self._current_action)
+        if self._current_action:
+            return self._current_action.get("action", "unknown")
+        if self._queue:
+            return self._queue[0].get("action", "idle")
+        return "idle"
+
+    async def _detect_runtime_events(self, peer_states: dict) -> None:
+        """
+        Convert non-visual runtime anomalies into shared swarm events.
+
+        This layer intentionally stops at event emission. It does not choose
+        who should react, patch actions, or claim follow-up work; those
+        decisions are left to the onboard model using the shared context.
+        """
+        now = time.time()
+        for peer_id, peer_state in peer_states.items():
+            if peer_id in self._reported_peer_loss:
+                continue
+            if (now - peer_state.updated_at) <= config.PEER_LOST_TIMEOUT:
+                continue
+
+            px, py, pz = peer_state.position
+            event = TaskEvent(
+                type="peer_lost",
+                source="memory_pool",
+                priority=2,
+                payload={
+                    "peer_id": peer_id,
+                    "last_known_position": [px, py, pz],
+                    "last_known_status": peer_state.status,
+                    "last_updated_at": peer_state.updated_at,
+                },
+            )
+            await self._emit_swarm_event(event)
+            if self._task_graph is not None:
+                self._task_graph.emit_event(event)
+            self._reported_peer_loss.add(peer_id)
+            self._sync_task_queues()
+            break
+
+    async def _get_swarm_claims(self) -> list:
+        getter = getattr(self._memory, "get_claims", None)
+        if getter is None:
+            return []
+        return await getter()
+
+    async def _get_swarm_events(self) -> list[TaskEvent]:
+        getter = getattr(self._memory, "get_events", None)
+        if getter is None:
+            return []
+        return await getter()
+
+    async def _emit_swarm_event(self, event: TaskEvent) -> None:
+        emitter = getattr(self._memory, "emit_event", None)
+        if emitter is not None:
+            await emitter(event)
+
+    async def _can_apply_modify(self, decision: VLMModify) -> bool:
+        """
+        Decide whether a VLM-issued modify should be accepted, with special
+        coordination rules for shared target claims.
+        """
+        event = getattr(decision, "event", None)
+        if event is None or event.type != "target_detected":
+            return True
+
+        acquire_claim = getattr(self._memory, "acquire_claim", None)
+        if acquire_claim is None:
+            return True
+
+        target_key = self._target_key_from_event(event)
+        if target_key is None:
+            return True
+
+        acquired = await acquire_claim(
+            claim_type="target_claim",
+            target_key=target_key,
+            claimant_id=self.drone_id,
+            ttl=config.CLAIM_LEASE_TTL,
+            payload=event.payload,
+        )
+        if acquired:
+            logger.info("[%s] Claimed target %s", self.drone_id, target_key)
+        return acquired
+
+    @staticmethod
+    def _target_key_from_event(event: TaskEvent) -> Optional[str]:
+        payload = event.payload
+        target_id = payload.get("target_id")
+        if isinstance(target_id, str) and target_id:
+            return target_id
+
+        raw_pos = payload.get("target_position")
+        if not isinstance(raw_pos, list) or len(raw_pos) < 2:
+            return None
+
+        x = float(raw_pos[0])
+        y = float(raw_pos[1])
+        z = float(raw_pos[2]) if len(raw_pos) > 2 else 0.0
+        # Quantise to 5 m buckets so near-identical detections collide.
+        qx = math.floor(x / 5.0)
+        qy = math.floor(y / 5.0)
+        qz = math.floor(z / 5.0)
+        return f"grid:{qx}:{qy}:{qz}"
 
     async def _safe_land(self) -> None:
         """Best-effort landing — does not raise."""
@@ -374,7 +548,8 @@ async def launch_drone(
     drone_id:        str,
     memory:          SharedMemoryPool,
     vlm:             VLMAgent,
-    initial_tasks:   list[dict],
+    initial_tasks:   Optional[list[dict]] = None,
+    task_graph:      Optional[LocalTaskGraph] = None,
     stop_when_empty: bool = False,
     sim_positions:   dict | None = None,
     vlm_log:         Optional[deque] = None,
@@ -400,6 +575,7 @@ async def launch_drone(
             memory          = memory,
             vlm             = vlm,
             initial_tasks   = initial_tasks,
+            task_graph      = task_graph,
             stop_when_empty = stop_when_empty,
             vlm_log         = vlm_log,
             task_queues     = task_queues,

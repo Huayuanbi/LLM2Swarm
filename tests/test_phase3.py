@@ -15,6 +15,7 @@ import asyncio
 import logging
 import sys
 import os
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -27,9 +28,11 @@ logging.basicConfig(
 import config
 from controllers import make_controller
 from memory.pool import SharedMemoryPool
-from models.schemas import VLMContinue, VLMModify, DroneState
+from models.schemas import AgentProfile, RoleBrief, TaskEvent, TaskGraphNode, TaskGraphSpec, VLMContinue, VLMModify, DroneState
 from operators.drone_lifecycle import DroneLifecycle, launch_drone
+from operators.local_planner import build_task_graph_runtime, compile_role_brief
 from operators.vlm_agent import VLMAgent
+from primitives import build_agent_profile
 
 
 # ─── Stub VLM — returns scripted decisions, no network ───────────────────────
@@ -66,6 +69,23 @@ TASKS_SEARCH = [
     {"action": "search_pattern", "params": {"center_x": 0.0, "center_y": 0.0,
                                              "radius": 5.0, "altitude": 8.0}},
 ]
+
+
+def _generic_role_with_bootstrap() -> RoleBrief:
+    return RoleBrief(
+        mission_role="Generic test role",
+        mission_intent="Exercise the generic role/task-graph interfaces.",
+        responsibilities=["maintain the assigned test context"],
+        coordination_contracts=["avoid duplicate work in the shared test context"],
+        event_watchlist=["peer_lost", "target_detected"],
+        shared_context={
+            "bootstrap_actions": [
+                {"action": "takeoff", "params": {"altitude": 8.0}},
+                {"action": "go_to_waypoint", "params": {"x": 0.0, "y": 0.0, "z": 8.0, "velocity": 5.0}},
+                {"action": "search_pattern", "params": {"center_x": 0.0, "center_y": 0.0, "radius": 5.0, "altitude": 8.0}},
+            ]
+        },
+    )
 
 
 # ─── Test 1: Lifecycle runs and exhausts a simple task queue ─────────────────
@@ -140,6 +160,235 @@ def test_vlm_modify():
     print("✓ test_vlm_modify")
 
 
+def test_task_graph_records_vlm_event_generically():
+    role = _generic_role_with_bootstrap()
+    task_graph = compile_role_brief("drone_1", role)
+
+    decision = VLMModify(
+        decision="modify",
+        new_task="inspect potential target",
+        new_action={
+            "action": "go_to_waypoint",
+            "params": {"x": 20.0, "y": 20.0, "z": 10.0, "velocity": 4.0},
+        },
+        event=TaskEvent(
+            type="target_detected",
+            source="vlm",
+            priority=2,
+            payload={"target_position": [20.0, 20.0, 10.0]},
+        ),
+    )
+
+    task_graph.apply_vlm_modify(
+        decision,
+        current_action={
+            "action": "search_pattern",
+            "params": {"center_x": 0.0, "center_y": 0.0, "radius": 5.0, "altitude": 8.0},
+        },
+    )
+    actions = [item["action"] for item in task_graph.preview_actions()[:2]]
+    assert actions[0] == "go_to_waypoint", actions
+    assert task_graph.event_history()[-1].type == "target_detected"
+
+def test_task_graph_records_vlm_event_generically_wrapper():
+    test_task_graph_records_vlm_event_generically()
+    print("✓ test_task_graph_records_vlm_event_generically")
+
+
+async def _test_target_claim_blocks_duplicate_modify():
+    pool = SharedMemoryPool(["drone_1", "drone_2"])
+    await pool.acquire_claim(
+        claim_type="target_claim",
+        target_key="grid:4:4:2",
+        claimant_id="drone_2",
+        ttl=30.0,
+        payload={"target_position": [20.0, 20.0, 10.0]},
+    )
+
+    ctrl = make_controller("drone_1")
+    await ctrl.connect()
+
+    role = _generic_role_with_bootstrap()
+    task_graph = compile_role_brief("drone_1", role)
+    before = task_graph.preview_actions()
+
+    lifecycle = DroneLifecycle(
+        drone_id="drone_1",
+        controller=ctrl,
+        memory=pool,
+        vlm=StubVLM([VLMContinue(decision="continue")]),
+        task_graph=task_graph,
+        stop_when_empty=True,
+    )
+
+    decision = VLMModify(
+        decision="modify",
+        new_task="inspect potential target",
+        new_action={"action": "hover", "params": {"duration": 2.0}},
+        event=TaskEvent(
+            type="target_detected",
+            source="vlm",
+            priority=2,
+            payload={"target_position": [20.0, 20.0, 10.0]},
+        ),
+        memory_update="potential fire at 20,20",
+    )
+
+    await lifecycle._apply_decision(decision)
+
+    after = task_graph.preview_actions()
+    assert after == before, "Task graph should stay unchanged when target claim is already owned"
+
+    claims = await pool.get_claims()
+    owners = [claim.claimant_id for claim in claims if claim.claim_type == "target_claim"]
+    assert owners == ["drone_2"], f"Expected drone_2 to keep the claim, got {owners}"
+
+    await ctrl.disconnect()
+
+def test_target_claim_blocks_duplicate_modify():
+    run(_test_target_claim_blocks_duplicate_modify())
+    print("✓ test_target_claim_blocks_duplicate_modify")
+
+
+async def _test_peer_loss_emits_shared_event_without_reallocation():
+    pool = SharedMemoryPool(["drone_1", "drone_2"])
+    ctrl = make_controller("drone_1")
+    await ctrl.connect()
+
+    role = _generic_role_with_bootstrap()
+    task_graph = compile_role_brief("drone_1", role)
+    before = task_graph.preview_actions()
+
+    lifecycle = DroneLifecycle(
+        drone_id="drone_1",
+        controller=ctrl,
+        memory=pool,
+        vlm=StubVLM([VLMContinue(decision="continue")]),
+        task_graph=task_graph,
+        stop_when_empty=True,
+    )
+
+    await pool.update_drone("drone_2", status="executing")
+    pool._store["drone_2"].updated_at = time.time() - config.PEER_LOST_TIMEOUT - 1.0
+
+    peer_states = await pool.get_peer_states("drone_1")
+    await lifecycle._detect_runtime_events(peer_states)
+
+    events = await pool.get_events()
+    assert events, "Expected a shared event to be emitted"
+    assert events[-1].type == "peer_lost"
+    assert events[-1].payload["peer_id"] == "drone_2"
+    assert task_graph.preview_actions() == before, "Framework should not auto-reallocate actions"
+
+    await ctrl.disconnect()
+
+def test_peer_loss_emits_shared_event_without_reallocation():
+    run(_test_peer_loss_emits_shared_event_without_reallocation())
+    print("✓ test_peer_loss_emits_shared_event_without_reallocation")
+
+
+async def _test_vlm_event_is_published_to_shared_stream():
+    pool = SharedMemoryPool(["drone_1"])
+    ctrl = make_controller("drone_1")
+    await ctrl.connect()
+
+    role = _generic_role_with_bootstrap()
+    task_graph = compile_role_brief("drone_1", role)
+
+    lifecycle = DroneLifecycle(
+        drone_id="drone_1",
+        controller=ctrl,
+        memory=pool,
+        vlm=StubVLM([VLMContinue(decision="continue")]),
+        task_graph=task_graph,
+        stop_when_empty=True,
+    )
+
+    decision = VLMModify(
+        decision="modify",
+        new_task="inspect scene change",
+        new_action={"action": "hover", "params": {"duration": 2.0}},
+        event=TaskEvent(
+            type="obstacle_detected",
+            source="vlm",
+            priority=1,
+            payload={"bearing_deg": 20.0},
+        ),
+    )
+
+    await lifecycle._apply_decision(decision)
+
+    events = await pool.get_events()
+    assert events[-1].type == "obstacle_detected"
+    assert task_graph.preview_actions()[0]["action"] == "hover"
+
+    await ctrl.disconnect()
+
+def test_vlm_event_is_published_to_shared_stream():
+    run(_test_vlm_event_is_published_to_shared_stream())
+    print("✓ test_vlm_event_is_published_to_shared_stream")
+
+
+def test_task_graph_runtime_accepts_generic_graph_spec():
+    role = RoleBrief(
+        mission_role="Generic runtime role",
+        mission_intent="Validate the task-graph runtime against a model-produced graph.",
+    )
+    spec = TaskGraphSpec(
+        graph_id="runtime-test",
+        summary="Two-step generic runtime graph",
+        nodes=[
+            TaskGraphNode(
+                node_id="n0",
+                label="takeoff",
+                action={"action": "takeoff", "params": {"altitude": 5.0}},
+            ),
+            TaskGraphNode(
+                node_id="n1",
+                label="hover",
+                action={"action": "hover", "params": {"duration": 0.1}},
+            ),
+        ],
+    )
+    runtime = build_task_graph_runtime("drone_1", role, spec)
+    preview = runtime.preview_actions()
+    assert [item["action"] for item in preview] == ["takeoff", "hover"]
+
+def test_task_graph_runtime_accepts_generic_graph_spec_wrapper():
+    test_task_graph_runtime_accepts_generic_graph_spec()
+    print("✓ test_task_graph_runtime_accepts_generic_graph_spec")
+
+
+def test_task_graph_runtime_rejects_capability_mismatch():
+    role = RoleBrief(
+        mission_role="Ground-only role",
+        mission_intent="Validate capability-aware runtime checks.",
+        capability_exclusions=["flight"],
+    )
+    profile = build_agent_profile(agent_id="drone_1", agent_kind="test_drone")
+    spec = TaskGraphSpec(
+        graph_id="runtime-mismatch",
+        summary="A graph that should be rejected",
+        nodes=[
+            TaskGraphNode(
+                node_id="n0",
+                label="takeoff",
+                action={"action": "takeoff", "params": {"altitude": 5.0}},
+            )
+        ],
+    )
+
+    try:
+        build_task_graph_runtime("drone_1", role, spec, agent_profile=profile)
+        assert False, "Expected capability-aware validation to reject the graph"
+    except ValueError as exc:
+        assert "role capability exclusions" in str(exc)
+
+def test_task_graph_runtime_rejects_capability_mismatch_wrapper():
+    test_task_graph_runtime_rejects_capability_mismatch()
+    print("✓ test_task_graph_runtime_rejects_capability_mismatch")
+
+
 # ─── Test 3: Memory pool reflects live telemetry during execution ─────────────
 
 async def _test_memory_sync():
@@ -197,8 +446,8 @@ async def _test_concurrent_drones():
         ],
         "drone_3": [
             {"action": "takeoff",        "params": {"altitude": 12.0}},
-            {"action": "search_pattern", "params": {"center_x": 0.0, "center_y": 0.0,
-                                                     "radius": 3.0, "altitude": 12.0}},
+            {"action": "go_to_waypoint", "params": {"x": 0.0, "y": -10.0, "z": 12.0, "velocity": 5.0}},
+            {"action": "hover",          "params": {"duration": 0.1}},
         ],
     }
 
@@ -289,6 +538,12 @@ if __name__ == "__main__":
     tests = [
         test_lifecycle_completes,
         test_vlm_modify,
+        test_task_graph_records_vlm_event_generically_wrapper,
+        test_target_claim_blocks_duplicate_modify,
+        test_peer_loss_emits_shared_event_without_reallocation,
+        test_vlm_event_is_published_to_shared_stream,
+        test_task_graph_runtime_accepts_generic_graph_spec_wrapper,
+        test_task_graph_runtime_rejects_capability_mismatch_wrapper,
         test_memory_sync,
         test_concurrent_drones,
         test_live_vlm,

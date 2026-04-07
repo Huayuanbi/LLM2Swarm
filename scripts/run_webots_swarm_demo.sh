@@ -20,6 +20,7 @@ export PYTHONPATH="${REPO_ROOT}:${WEBOTS_CONTROLLER_PY}:${PYTHONPATH:-}"
 export SIMULATOR_BACKEND=webots
 export WEBOTS_SWARM_DRONES="${WEBOTS_SWARM_DRONES:-drone_1,drone_2,drone_3}"
 export WEBOTS_SWARM_DB="${WEBOTS_SWARM_DB:-/tmp/llm2swarm_webots_swarm.sqlite3}"
+export WEBOTS_SWARM_WORLD_FILE="${WEBOTS_SWARM_WORLD_FILE:-${WORLD_FILE}}"
 
 cd "${REPO_ROOT}"
 conda run -n llm2swarm python scripts/prepare_webots_swarm_plan.py
