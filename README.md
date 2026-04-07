@@ -521,6 +521,91 @@ python main.py
 - 得到初始 `TaskGraph`
 - 启动 `DroneLifecycle`
 
+## Tunnel / Remote Ollama
+
+当前仓库里的云端角色规划、机载 planner、VLM demo，默认都不是直接连公网 API，
+而是通过本机 SSH tunnel 转发到远端 Ollama 服务。
+
+也就是说，README 里这些地址：
+
+- `http://localhost:11435/v1`
+
+通常表示的是：
+
+- `本机 11435` -> `SSH tunnel` -> `远端 Ollama server`
+
+而不是“你本机自己启动了一个 Ollama”。
+
+### 什么时候需要 tunnel
+
+如果你要运行这些路径，就需要先确保 tunnel 是通的：
+
+- `GlobalOperator.assign_roles()`
+- `OnboardPlannerAgent.build_initial_task_graph()`
+- `VLMAgent.decide()`
+- `./scripts/run_webots_single_demo.sh`
+- `./scripts/run_webots_swarm_demo.sh`
+- `tests/test_phase3.py` 里的 live VLM 部分
+
+如果 tunnel 没起：
+
+- `curl http://localhost:11435/...` 会失败
+- live 模型调用会超时或报 connection error
+- Webots demo 会退回 fallback 或卡在在线模型步骤
+
+### 启动方式
+
+先检查状态：
+
+```bash
+./scripts/start_tunnel.sh --status
+```
+
+如果 tunnel 没有建立，再启动：
+
+```bash
+./scripts/start_tunnel.sh
+```
+
+### 如何确认 tunnel 已经打通
+
+最直接的检查方法：
+
+```bash
+curl --noproxy localhost -s http://localhost:11435/api/tags
+```
+
+如果正常，你应该能看到类似：
+
+- `qwen3.5:4b`
+- `qwen3.5:9b`
+
+也可以用脚本自带状态检查：
+
+```bash
+./scripts/start_tunnel.sh --status
+```
+
+### 和 `.env` 的关系
+
+当前常见配置是：
+
+```env
+EDGE_VLM_BASE_URL=http://localhost:11435/v1
+GLOBAL_LLM_BASE_URL=http://localhost:11435/v1
+ONBOARD_PLANNER_BASE_URL=http://localhost:11435/v1
+```
+
+这些值只有在 tunnel 正常建立时才有意义。
+
+如果后续你改成：
+
+- 直接连远端可访问地址
+- 直接连本机 Ollama
+- 或切回 OpenAI / 其他 provider
+
+那么 tunnel 这一步就可以相应调整或去掉。
+
 ## 环境变量
 
 最常用的是：
