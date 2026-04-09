@@ -277,12 +277,7 @@ async def _prepare() -> None:
     swarm_ids = _parse_swarm_ids()
     mission = os.getenv(
         "WEBOTS_SWARM_MISSION",
-        (
-            "Multi-drone mission. Drone 1 inspects the manor area from the west. "
-            "Drone 2 surveys the windmill corridor to the south. Drone 3 patrols "
-            "the northern tree line and acts as overwatch. Each drone should take "
-            "off first, avoid duplicated coverage, and adapt based on onboard vision."
-        ),
+        "search the area for fire",
     )
     db_path = os.getenv("WEBOTS_SWARM_DB", "/tmp/llm2swarm_webots_swarm.sqlite3")
 

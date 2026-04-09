@@ -39,6 +39,7 @@
 - 把 `OnboardPlannerAgent` 升级成多步 agent
 - 把 `VLMAgent` 升级成支持工具调用的本地 agent
 - 给三层 planner 都增加 prompt/version metadata
+- 精简 `OnboardPlannerAgent` prompt，减少重复上下文，提供更适合弱模型的 bootstrap-only 规划模式
 
 ## P0: 新增动作的标准入口
 
@@ -49,10 +50,7 @@
    - [controllers/mock_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/mock_controller.py)
    - [controllers/webots_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/webots_controller.py)
 3. 如果动作代表新的能力/资源，更新 `capability_tags / resource_tags`
-4. 如果仍使用旧 `plan_mission()` 兼容路径，补 legacy schema
-   - [models/schemas.py](/Users/hyb/LocalProj/LLM2Swarm/models/schemas.py)
-   - [operators/global_operator.py](/Users/hyb/LocalProj/LLM2Swarm/operators/global_operator.py)
-5. 增加测试
+4. 增加测试
 
 建议后续工作：
 
@@ -79,7 +77,7 @@
 
 ## P1: TaskGraph runtime 增强
 
-当前 runtime 还是偏“线性 primitive 执行”。
+runtime 目前仍偏“线性 primitive 执行”。
 
 建议后续工作：
 
@@ -163,7 +161,7 @@
 - [tests/test_phase2.py](/Users/hyb/LocalProj/LLM2Swarm/tests/test_phase2.py)
 - [tests/test_phase3.py](/Users/hyb/LocalProj/LLM2Swarm/tests/test_phase3.py)
 
-## 当前的原则
+## 原则
 
 - 不把某个具体场景策略写死在框架里
 - 不把“模型聪明程度”当成 runtime 正确性的前提

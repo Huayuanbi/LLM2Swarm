@@ -18,8 +18,6 @@ import logging
 import re
 from typing import Optional
 
-from openai import AsyncOpenAI
-
 import config
 from models.schemas import (
     OnboardPlanningContext,
@@ -28,6 +26,8 @@ from models.schemas import (
 )
 from operators.local_planner import build_task_graph_runtime, compatibility_task_graph_from_role_brief
 from primitives.registry import format_primitives_for_prompt
+from utils.debug_gate import DEBUG_GATE
+from utils.openai_client import build_async_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ class OnboardPlannerAgent:
     """
 
     def __init__(self):
-        self._client = AsyncOpenAI(
+        self._client = build_async_openai_client(
             api_key=config.ONBOARD_PLANNER_API_KEY,
             base_url=config.ONBOARD_PLANNER_BASE_URL,
         )
@@ -107,50 +107,104 @@ class OnboardPlannerAgent:
         self,
         context: OnboardPlanningContext,
     ) -> OnboardPlanningResponse:
-        try:
-            response = await asyncio.wait_for(
-                self._call_planner(context),
-                timeout=config.ONBOARD_PLANNER_TIMEOUT,
+        while True:
+            await DEBUG_GATE.checkpoint(
+                "onboard_request",
+                {
+                    "model": config.ONBOARD_PLANNER_MODEL,
+                    "context": context,
+                    "user_prompt": _build_user_prompt(context),
+                },
+                actor_id=context.drone_id,
+                summary="Inspect onboard task-graph planning request before sending.",
             )
-            build_task_graph_runtime(
-                context.drone_id,
-                context.role_brief,
-                response.task_graph,
-                agent_profile=context.agent_profile,
-            )
-            logger.info("[%s] Onboard planner produced graph '%s'", context.drone_id, response.task_graph.graph_id)
-            return response
-        except Exception as exc:
-            logger.warning(
-                "[%s] Onboard planner failed (%s); using compatibility bootstrap graph.",
-                context.drone_id,
-                exc,
-            )
-            fallback = compatibility_task_graph_from_role_brief(context.drone_id, context.role_brief)
             try:
+                response = await asyncio.wait_for(
+                    self._call_planner(context),
+                    timeout=config.ONBOARD_PLANNER_TIMEOUT,
+                )
                 build_task_graph_runtime(
                     context.drone_id,
                     context.role_brief,
-                    fallback,
+                    response.task_graph,
                     agent_profile=context.agent_profile,
                 )
-            except Exception as fallback_exc:
+                command = await DEBUG_GATE.checkpoint(
+                    "onboard_response",
+                    {
+                        "model": config.ONBOARD_PLANNER_MODEL,
+                        "drone_id": context.drone_id,
+                        "fallback_used": False,
+                        "response": response,
+                    },
+                    actor_id=context.drone_id,
+                    allow_regenerate=True,
+                    summary="Inspect validated onboard task-graph output.",
+                )
+                if command == "regenerate":
+                    logger.info("[%s] Regenerating onboard task graph due to debug gate request.", context.drone_id)
+                    continue
+                logger.info("[%s] Onboard planner produced graph '%s'", context.drone_id, response.task_graph.graph_id)
+                return response
+            except Exception as exc:
+                error_type = type(exc).__name__
+                error_repr = repr(exc)
                 logger.warning(
-                    "[%s] Compatibility bootstrap graph also failed validation (%s); using empty graph.",
+                    "[%s] Onboard planner failed (%s: %s); using compatibility bootstrap graph.",
                     context.drone_id,
-                    fallback_exc,
+                    error_type,
+                    exc,
                 )
-                fallback = TaskGraphSpec(
-                    graph_id=f"{context.drone_id}-empty-bootstrap",
-                    summary=f"Empty bootstrap graph for {context.role_brief.mission_role}",
-                    nodes=[],
-                    edges=[],
-                    metadata={"source": "validated_empty_fallback"},
+                fallback = compatibility_task_graph_from_role_brief(context.drone_id, context.role_brief)
+                fallback_notes = ["compatibility_fallback"]
+                fallback_source = "compatibility_fallback"
+                try:
+                    build_task_graph_runtime(
+                        context.drone_id,
+                        context.role_brief,
+                        fallback,
+                        agent_profile=context.agent_profile,
+                    )
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "[%s] Compatibility bootstrap graph also failed validation (%s); using empty graph.",
+                        context.drone_id,
+                        fallback_exc,
+                    )
+                    fallback = TaskGraphSpec(
+                        graph_id=f"{context.drone_id}-empty-bootstrap",
+                        summary=f"Empty bootstrap graph for {context.role_brief.mission_role}",
+                        nodes=[],
+                        edges=[],
+                        metadata={"source": "validated_empty_fallback"},
+                    )
+                    fallback_notes.append(f"fallback_validation_error:{fallback_exc}")
+                    fallback_source = "validated_empty_fallback"
+
+                fallback_response = OnboardPlanningResponse(
+                    task_graph=fallback,
+                    planner_notes=fallback_notes,
                 )
-            return OnboardPlanningResponse(
-                task_graph=fallback,
-                planner_notes=["compatibility_fallback"],
-            )
+                command = await DEBUG_GATE.checkpoint(
+                    "onboard_response",
+                    {
+                        "model": config.ONBOARD_PLANNER_MODEL,
+                        "drone_id": context.drone_id,
+                        "fallback_used": True,
+                        "fallback_source": fallback_source,
+                        "error": str(exc),
+                        "error_type": error_type,
+                        "error_repr": error_repr,
+                        "response": fallback_response,
+                    },
+                    actor_id=context.drone_id,
+                    allow_regenerate=True,
+                    summary="Inspect onboard planner fallback output.",
+                )
+                if command == "regenerate":
+                    logger.info("[%s] Regenerating onboard task graph after fallback due to debug gate request.", context.drone_id)
+                    continue
+                return fallback_response
 
     async def _call_planner(self, context: OnboardPlanningContext) -> OnboardPlanningResponse:
         response = await self._client.chat.completions.create(
@@ -171,18 +225,27 @@ def _build_user_prompt(context: OnboardPlanningContext) -> str:
     peer_states = {drone_id: state.model_dump() for drone_id, state in context.peer_states.items()}
     claims = [claim.model_dump() for claim in context.active_claims]
     events = [event.model_dump() for event in context.active_events]
-    primitives = [primitive.model_dump() for primitive in context.available_primitives]
+    primitive_names = [primitive.name for primitive in context.available_primitives]
+    agent_profile_summary = None
+    if context.agent_profile is not None:
+        agent_profile_summary = {
+            "agent_id": context.agent_profile.agent_id,
+            "agent_kind": context.agent_profile.agent_kind,
+            "available_resources": context.agent_profile.available_resources,
+            "hard_constraints": context.agent_profile.hard_constraints,
+            "metadata": context.agent_profile.metadata,
+        }
 
     payload = {
         "drone_id": context.drone_id,
         "role_brief": context.role_brief.model_dump(),
-        "agent_profile": context.agent_profile.model_dump() if context.agent_profile is not None else None,
+        "agent_profile": agent_profile_summary,
         "self_state": self_state,
         "peer_states": peer_states,
         "active_claims": claims,
         "active_events": events,
         "available_capabilities": context.available_capabilities,
-        "available_primitives": primitives,
+        "available_primitives": primitive_names,
         "has_image": bool(context.image_b64),
     }
     primitive_text = format_primitives_for_prompt(context.available_primitives)

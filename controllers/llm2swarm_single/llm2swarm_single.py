@@ -51,11 +51,7 @@ logger = logging.getLogger("webots-single")
 DRONE_ID = os.getenv("WEBOTS_DEMO_DRONE_ID", "drone_1")
 DEFAULT_MISSION = os.getenv(
     "WEBOTS_DEMO_MISSION",
-    (
-        "Single drone mission. Take off to 12 meters, inspect the rural area "
-        "around the manor with a 20 meter radius search pattern, and adapt if "
-        "the onboard vision model sees an obstacle or a better target."
-    ),
+    "search the area for fire",
 )
 
 

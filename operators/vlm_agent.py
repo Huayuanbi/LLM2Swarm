@@ -24,8 +24,6 @@ import re
 import time
 from typing import Optional
 
-from openai import AsyncOpenAI
-
 import config
 from models.schemas import (
     DroneState,
@@ -36,7 +34,9 @@ from models.schemas import (
     parse_vlm_decision,
 )
 from primitives.registry import format_primitives_for_prompt
+from utils.debug_gate import DEBUG_GATE
 from utils.image_utils import build_image_message
+from utils.openai_client import build_async_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ class VLMAgent:
     """
 
     def __init__(self):
-        self._client = AsyncOpenAI(
+        self._client = build_async_openai_client(
             api_key=config.EDGE_VLM_API_KEY,
             base_url=config.EDGE_VLM_BASE_URL,
         )
@@ -118,41 +118,112 @@ class VLMAgent:
 
         Falls back to VLMContinue on timeout or parse error.
         """
-        user_content = _build_user_content(
-            drone_id,
-            position,
-            velocity,
-            status,
-            current_task,
-            image_b64,
-            peer_states,
-            claims or [],
-            events or [],
-            available_primitives or [],
-            available_capabilities or [],
-        )
+        claims = claims or []
+        events = events or []
+        available_primitives = available_primitives or []
+        available_capabilities = available_capabilities or []
 
-        try:
-            decision = await asyncio.wait_for(
-                self._call_vlm(user_content),
-                timeout=config.VLM_TIMEOUT,
+        while True:
+            user_content = _build_user_content(
+                drone_id,
+                position,
+                velocity,
+                status,
+                current_task,
+                image_b64,
+                peer_states,
+                claims,
+                events,
+                available_primitives,
+                available_capabilities,
             )
-            logger.info("[%s] VLM decision: %s", drone_id, decision.decision)
-            return decision
+            await DEBUG_GATE.checkpoint(
+                "vlm_request",
+                _build_vlm_debug_payload(
+                    drone_id=drone_id,
+                    position=position,
+                    velocity=velocity,
+                    status=status,
+                    current_task=current_task,
+                    peer_states=peer_states,
+                    claims=claims,
+                    events=events,
+                    available_primitives=available_primitives,
+                    available_capabilities=available_capabilities,
+                    user_content=user_content,
+                    image_b64=image_b64,
+                ),
+                actor_id=drone_id,
+                summary="Inspect VLM request before sending.",
+            )
 
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[%s] VLM timed out after %.1f s — defaulting to '%s'",
-                drone_id, config.VLM_TIMEOUT, config.VLM_FALLBACK_DECISION,
-            )
-            return parse_vlm_decision({"decision": config.VLM_FALLBACK_DECISION})
+            try:
+                decision = await asyncio.wait_for(
+                    self._call_vlm(user_content),
+                    timeout=config.VLM_TIMEOUT,
+                )
+                command = await DEBUG_GATE.checkpoint(
+                    "vlm_response",
+                    {
+                        "model": config.EDGE_VLM_MODEL,
+                        "drone_id": drone_id,
+                        "decision": decision,
+                    },
+                    actor_id=drone_id,
+                    allow_regenerate=True,
+                    summary="Inspect VLM decision before applying it to runtime.",
+                )
+                if command == "regenerate":
+                    logger.info("[%s] Regenerating VLM decision due to debug gate request.", drone_id)
+                    continue
+                logger.info("[%s] VLM decision: %s", drone_id, decision.decision)
+                return decision
 
-        except Exception as e:
-            logger.error(
-                "[%s] VLM error: %s — defaulting to '%s'",
-                drone_id, e, config.VLM_FALLBACK_DECISION,
-            )
-            return parse_vlm_decision({"decision": config.VLM_FALLBACK_DECISION})
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] VLM timed out after %.1f s — defaulting to '%s'",
+                    drone_id, config.VLM_TIMEOUT, config.VLM_FALLBACK_DECISION,
+                )
+                decision = parse_vlm_decision({"decision": config.VLM_FALLBACK_DECISION})
+                command = await DEBUG_GATE.checkpoint(
+                    "vlm_response",
+                    {
+                        "model": config.EDGE_VLM_MODEL,
+                        "drone_id": drone_id,
+                        "timeout": True,
+                        "decision": decision,
+                    },
+                    actor_id=drone_id,
+                    allow_regenerate=True,
+                    summary="Inspect VLM timeout fallback decision.",
+                )
+                if command == "regenerate":
+                    logger.info("[%s] Retrying VLM call after timeout due to debug gate request.", drone_id)
+                    continue
+                return decision
+
+            except Exception as e:
+                logger.error(
+                    "[%s] VLM error: %s — defaulting to '%s'",
+                    drone_id, e, config.VLM_FALLBACK_DECISION,
+                )
+                decision = parse_vlm_decision({"decision": config.VLM_FALLBACK_DECISION})
+                command = await DEBUG_GATE.checkpoint(
+                    "vlm_response",
+                    {
+                        "model": config.EDGE_VLM_MODEL,
+                        "drone_id": drone_id,
+                        "error": str(e),
+                        "decision": decision,
+                    },
+                    actor_id=drone_id,
+                    allow_regenerate=True,
+                    summary="Inspect VLM error fallback decision.",
+                )
+                if command == "regenerate":
+                    logger.info("[%s] Retrying VLM call after error due to debug gate request.", drone_id)
+                    continue
+                return decision
 
     async def _call_vlm(self, user_content: list[dict]) -> VLMDecision:
         """Raw API call + parse. Raises on any error."""
@@ -242,6 +313,39 @@ def _build_user_content(
         {"type": "text",      "text": text_prompt},
         build_image_message(image_b64),
     ]
+
+
+def _build_vlm_debug_payload(
+    *,
+    drone_id: str,
+    position: tuple[float, float, float],
+    velocity: tuple[float, float, float],
+    status: str,
+    current_task: Optional[str],
+    peer_states: dict[str, DroneState],
+    claims: list[TaskClaim],
+    events: list[TaskEvent],
+    available_primitives: list[PrimitiveSpec],
+    available_capabilities: list[str],
+    user_content: list[dict],
+    image_b64: str,
+) -> dict:
+    text_blocks = [item.get("text", "") for item in user_content if item.get("type") == "text"]
+    return {
+        "model": config.EDGE_VLM_MODEL,
+        "drone_id": drone_id,
+        "position": position,
+        "velocity": velocity,
+        "status": status,
+        "current_task": current_task,
+        "peer_states": peer_states,
+        "claims": claims,
+        "events": events,
+        "available_primitives": available_primitives,
+        "available_capabilities": available_capabilities,
+        "user_text_blocks": text_blocks,
+        "image_b64_length": len(image_b64),
+    }
 
 
 def _parse_vlm_response(raw: str) -> VLMDecision:

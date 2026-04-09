@@ -21,16 +21,16 @@ import logging
 import re
 from typing import Callable, Optional
 
-from openai import AsyncOpenAI
-
 import config
 from models.schemas import AgentProfile, DroneState, GlobalPlan, GlobalRolePlan
 from primitives.registry import format_primitives_for_prompt, list_registered_primitives
+from utils.debug_gate import DEBUG_GATE
+from utils.openai_client import build_async_openai_client, should_bypass_env_proxy
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES      = 3
-RETRY_BASE_DELAY = 2.0   # seconds; doubles each attempt
+MAX_RETRIES      = config.GLOBAL_LLM_MAX_RETRIES
+RETRY_BASE_DELAY = config.GLOBAL_LLM_RETRY_BASE_DELAY
 
 
 # ─── System prompt ────────────────────────────────────────────────────────────
@@ -124,14 +124,16 @@ class GlobalOperator:
 
     def __init__(self, drone_ids: Optional[list[str]] = None):
         self._drone_ids = drone_ids or config.DRONE_IDS
-        # Use Ollama-compatible base URL when configured, otherwise default to OpenAI
-        client_kwargs: dict = {
-            "api_key":     config.GLOBAL_LLM_API_KEY or "nokey",
-            "max_retries": 0,   # disable SDK-level retries; our loop handles them
-        }
-        if config.GLOBAL_LLM_BASE_URL:
-            client_kwargs["base_url"] = config.GLOBAL_LLM_BASE_URL
-        self._client = AsyncOpenAI(**client_kwargs)
+        self._client = build_async_openai_client(
+            api_key=config.GLOBAL_LLM_API_KEY or "nokey",
+            base_url=config.GLOBAL_LLM_BASE_URL or None,
+            max_retries=0,   # disable SDK-level retries; our loop handles them
+        )
+        if should_bypass_env_proxy(config.GLOBAL_LLM_BASE_URL):
+            logger.info(
+                "GlobalOperator: bypassing environment HTTP proxy for local/private base URL %s",
+                config.GLOBAL_LLM_BASE_URL,
+            )
 
     async def plan_mission(self, mission_description: str) -> GlobalPlan:
         """
@@ -156,16 +158,43 @@ class GlobalOperator:
             {"role": "user",    "content": user_message},
         ]
 
-        plan = await self._run_json_planner(
-            messages=messages,
-            parser=lambda raw: _parse_plan(raw, self._drone_ids),
-            parse_target="plan",
-        )
-        logger.info(
-            "GlobalOperator: plan created for drones %s",
-            list(plan.plan.keys()),
-        )
-        return plan
+        while True:
+            await DEBUG_GATE.checkpoint(
+                "cloud_request",
+                {
+                    "mode": "plan_mission",
+                    "model": config.GLOBAL_LLM_MODEL,
+                    "mission": mission_description,
+                    "messages": messages,
+                },
+                actor_id="cloud",
+                summary="Inspect cloud action-plan request before sending.",
+            )
+            plan = await self._run_json_planner(
+                messages=messages,
+                parser=lambda raw: _parse_plan(raw, self._drone_ids),
+                parse_target="plan",
+            )
+            command = await DEBUG_GATE.checkpoint(
+                "cloud_response",
+                {
+                    "mode": "plan_mission",
+                    "model": config.GLOBAL_LLM_MODEL,
+                    "mission": mission_description,
+                    "parsed_plan": plan.model_dump(),
+                },
+                actor_id="cloud",
+                allow_regenerate=True,
+                summary="Inspect parsed cloud action-plan output.",
+            )
+            if command == "regenerate":
+                logger.info("GlobalOperator: regenerating action plan due to debug gate request.")
+                continue
+            logger.info(
+                "GlobalOperator: plan created for drones %s",
+                list(plan.plan.keys()),
+            )
+            return plan
 
     async def assign_roles(
         self,
@@ -195,22 +224,53 @@ class GlobalOperator:
             {"role": "user", "content": user_message},
         ]
 
-        roles = await self._run_json_planner(
-            messages=messages,
-            parser=lambda raw: _parse_role_plan(raw, self._drone_ids),
-            parse_target="role plan",
-        )
-        logger.info(
-            "GlobalOperator: role briefs created for drones %s",
-            list(roles.roles.keys()),
-        )
-        return roles
+        while True:
+            await DEBUG_GATE.checkpoint(
+                "cloud_request",
+                {
+                    "mode": "assign_roles",
+                    "model": config.GLOBAL_LLM_MODEL,
+                    "mission": mission_description,
+                    "initial_states": initial_states,
+                    "agent_profiles": agent_profiles,
+                    "messages": messages,
+                },
+                actor_id="cloud",
+                summary="Inspect cloud role-allocation request before sending.",
+            )
+            roles = await self._run_json_planner(
+                messages=messages,
+                parser=lambda raw: _parse_role_plan(raw, self._drone_ids),
+                validator=lambda plan: _validate_role_plan(plan, self._drone_ids, agent_profiles),
+                parse_target="role plan",
+            )
+            command = await DEBUG_GATE.checkpoint(
+                "cloud_response",
+                {
+                    "mode": "assign_roles",
+                    "model": config.GLOBAL_LLM_MODEL,
+                    "mission": mission_description,
+                    "parsed_roles": roles.model_dump(),
+                },
+                actor_id="cloud",
+                allow_regenerate=True,
+                summary="Inspect parsed cloud role-allocation output.",
+            )
+            if command == "regenerate":
+                logger.info("GlobalOperator: regenerating role briefs due to debug gate request.")
+                continue
+            logger.info(
+                "GlobalOperator: role briefs created for drones %s",
+                list(roles.roles.keys()),
+            )
+            return roles
 
     async def _run_json_planner(
         self,
         *,
         messages: list[dict[str, str]],
         parser: Callable[[str], object],
+        validator: Optional[Callable[[object], object]] = None,
         parse_target: str,
     ):
         """
@@ -243,13 +303,16 @@ class GlobalOperator:
                     model=config.GLOBAL_LLM_MODEL,
                     messages=working_messages,
                     temperature=0.2,
-                    timeout=120.0,
+                    timeout=config.GLOBAL_LLM_TIMEOUT,
                     **extra,
                 )
 
                 raw_content = response.choices[0].message.content or ""
                 logger.debug("GlobalOperator raw %s response:\n%s", parse_target, raw_content)
-                return parser(raw_content)
+                parsed = parser(raw_content)
+                if validator is not None:
+                    validator(parsed)
+                return parsed
 
             except (json.JSONDecodeError, ValueError) as e:
                 last_error = str(e)
@@ -263,7 +326,16 @@ class GlobalOperator:
 
             except Exception as e:
                 last_error = str(e)
-                logger.error("GlobalOperator: API error on attempt %d: %s", attempt, e)
+                if last_error == "Connection error." and config.GLOBAL_LLM_BASE_URL:
+                    logger.error(
+                        "GlobalOperator: API error on attempt %d: %s "
+                        "(base_url=%s; check SSH tunnel and local proxy settings)",
+                        attempt,
+                        e,
+                        config.GLOBAL_LLM_BASE_URL,
+                    )
+                else:
+                    logger.error("GlobalOperator: API error on attempt %d: %s", attempt, e)
 
             if attempt < MAX_RETRIES:
                 delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
@@ -337,6 +409,59 @@ def _parse_role_plan(raw: str, drone_ids: list[str]) -> GlobalRolePlan:
     return plan
 
 
+def _validate_role_plan(
+    plan: GlobalRolePlan,
+    drone_ids: list[str],
+    agent_profiles: Optional[dict[str, AgentProfile | dict]],
+) -> None:
+    """
+    Validate that each generated RoleBrief is actually feasible for the target
+    agent profile before it is handed to onboard planners.
+
+    This shifts the primary correction loop to the cloud stage so we can feed
+    invalid role assignments back to the cloud planner for regeneration instead
+    of letting them degrade into empty onboard graphs.
+    """
+    profiles = _normalise_agent_profiles(drone_ids, agent_profiles)
+    if not profiles:
+        return
+
+    errors: list[str] = []
+    for drone_id, role_brief in plan.roles.items():
+        profile = profiles.get(drone_id)
+        if profile is None:
+            continue
+
+        available_capabilities = set(profile.available_capabilities)
+        available_resources = set(profile.available_resources)
+
+        missing_capabilities = set(role_brief.capability_requirements) - available_capabilities
+        if missing_capabilities:
+            errors.append(
+                f"{drone_id}: role '{role_brief.mission_role}' requires unavailable capabilities "
+                f"{sorted(missing_capabilities)}"
+            )
+
+        contradictory_exclusions = set(role_brief.capability_requirements) & set(role_brief.capability_exclusions)
+        if contradictory_exclusions:
+            errors.append(
+                f"{drone_id}: role '{role_brief.mission_role}' both requires and excludes capabilities "
+                f"{sorted(contradictory_exclusions)}"
+            )
+
+        missing_resources = set(role_brief.resource_requirements) - available_resources
+        if missing_resources:
+            errors.append(
+                f"{drone_id}: role '{role_brief.mission_role}' requires unavailable resources "
+                f"{sorted(missing_resources)}"
+            )
+
+    if errors:
+        raise ValueError(
+            "Role plan violates agent-profile constraints:\n- " + "\n- ".join(errors)
+        )
+
+
 def _build_initial_state_context(
     drone_ids: list[str],
     initial_states: Optional[dict[str, DroneState | dict]],
@@ -371,7 +496,8 @@ def _build_agent_profile_context(
     drone_ids: list[str],
     agent_profiles: Optional[dict[str, AgentProfile | dict]],
 ) -> str:
-    if not agent_profiles:
+    profiles = _normalise_agent_profiles(drone_ids, agent_profiles)
+    if not profiles:
         return "\n".join(
             f"  {drone_id}: kind=(unknown) capabilities=(unknown) primitives=(unknown) resources=(unknown)"
             for drone_id in drone_ids
@@ -379,14 +505,7 @@ def _build_agent_profile_context(
 
     lines = []
     for drone_id in drone_ids:
-        raw = agent_profiles.get(drone_id) if agent_profiles else None
-        profile = raw if isinstance(raw, AgentProfile) else None
-        if profile is None and isinstance(raw, dict):
-            try:
-                profile = AgentProfile.model_validate({"agent_id": drone_id, **raw})
-            except Exception:
-                profile = None
-
+        profile = profiles.get(drone_id)
         if profile is None:
             lines.append(
                 f"  {drone_id}: kind=(unknown) capabilities=(unknown) primitives=(unknown) resources=(unknown)"
@@ -401,3 +520,24 @@ def _build_agent_profile_context(
             f"resources={profile.available_resources or ['(none)']}"
         )
     return "\n".join(lines)
+
+
+def _normalise_agent_profiles(
+    drone_ids: list[str],
+    agent_profiles: Optional[dict[str, AgentProfile | dict]],
+) -> dict[str, AgentProfile]:
+    if not agent_profiles:
+        return {}
+
+    profiles: dict[str, AgentProfile] = {}
+    for drone_id in drone_ids:
+        raw = agent_profiles.get(drone_id)
+        profile = raw if isinstance(raw, AgentProfile) else None
+        if profile is None and isinstance(raw, dict):
+            try:
+                profile = AgentProfile.model_validate({"agent_id": drone_id, **raw})
+            except Exception:
+                profile = None
+        if profile is not None:
+            profiles[drone_id] = profile
+    return profiles

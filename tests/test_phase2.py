@@ -11,8 +11,12 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,6 +33,8 @@ from models.schemas import (
 from primitives import build_agent_profile
 from operators.global_operator import GlobalOperator
 from operators.onboard_planner import _SYSTEM_PROMPT as ONBOARD_SYSTEM_PROMPT, _build_user_prompt
+from utils.debug_gate import DebugGate, list_pending_steps, read_step_metadata
+from utils.openai_client import should_bypass_env_proxy
 import config
 
 
@@ -234,6 +240,15 @@ def test_agent_profile_derives_capabilities_from_primitives():
     print("✓ test_agent_profile_derives_capabilities_from_primitives")
 
 
+def test_openai_client_proxy_bypass_detection():
+    assert should_bypass_env_proxy("http://localhost:11435/v1")
+    assert should_bypass_env_proxy("http://127.0.0.1:11435/v1")
+    assert should_bypass_env_proxy("http://10.130.138.37:11434/v1")
+    assert not should_bypass_env_proxy("https://api.openai.com/v1")
+    assert not should_bypass_env_proxy(None)
+    print("✓ test_openai_client_proxy_bypass_detection")
+
+
 async def _test_assign_roles_prompt_contract():
     mission = "search the area for fire"
     initial_states = {
@@ -256,7 +271,7 @@ async def _test_assign_roles_prompt_contract():
 
     captured: dict = {}
 
-    async def fake_run_json_planner(*, messages, parser, parse_target):
+    async def fake_run_json_planner(*, messages, parser, parse_target, validator=None):
         captured["messages"] = messages
         captured["parse_target"] = parse_target
         return GlobalRolePlan.model_validate(
@@ -302,6 +317,84 @@ async def _test_assign_roles_prompt_contract():
 def test_assign_roles_prompt_contract():
     run(_test_assign_roles_prompt_contract())
     print("✓ test_assign_roles_prompt_contract")
+
+
+async def _test_assign_roles_profile_validation_regenerates():
+    mission = "search the area for fire"
+    agent_profiles = {
+        "drone_1": build_agent_profile(agent_id="drone_1", agent_kind="test_uav"),
+        "drone_2": build_agent_profile(agent_id="drone_2", agent_kind="test_uav"),
+        "drone_3": build_agent_profile(agent_id="drone_3", agent_kind="test_uav"),
+    }
+    op = GlobalOperator(drone_ids=["drone_1", "drone_2", "drone_3"])
+
+    invalid_role_json = json.dumps(
+        {
+            "drone_1": {
+                "mission_role": "searcher",
+                "mission_intent": "search the area for fire",
+            },
+            "drone_2": {
+                "mission_role": "searcher",
+                "mission_intent": "search the area for fire",
+            },
+            "drone_3": {
+                "mission_role": "swarm_coordinator",
+                "mission_intent": "coordinate the swarm",
+                "capability_requirements": ["communication"],
+            },
+        }
+    )
+    valid_role_json = json.dumps(
+        {
+            "drone_1": {
+                "mission_role": "searcher",
+                "mission_intent": "search the area for fire",
+            },
+            "drone_2": {
+                "mission_role": "searcher",
+                "mission_intent": "search the area for fire",
+            },
+            "drone_3": {
+                "mission_role": "observer",
+                "mission_intent": "maintain local observation and publish events",
+                "capability_requirements": ["persistent_monitoring"],
+            },
+        }
+    )
+
+    call_messages: list[list[dict[str, str]]] = []
+    responses = [invalid_role_json, valid_role_json]
+
+    async def fake_create(*, model, messages, temperature, timeout, **extra):
+        call_messages.append(messages)
+        content = responses[len(call_messages) - 1]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+    op._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=fake_create)
+        )
+    )
+
+    plan = await op.assign_roles(mission, agent_profiles=agent_profiles)
+
+    assert isinstance(plan, GlobalRolePlan)
+    assert plan.roles["drone_3"].mission_role == "observer"
+    assert len(call_messages) == 2
+    second_attempt_messages = call_messages[1]
+    assert any(
+        "requires unavailable capabilities ['communication']" in message["content"]
+        for message in second_attempt_messages
+        if message["role"] == "user"
+    )
+
+
+def test_assign_roles_profile_validation_regenerates():
+    run(_test_assign_roles_profile_validation_regenerates())
+    print("✓ test_assign_roles_profile_validation_regenerates")
 
 
 def test_onboard_planner_prompt_contract():
@@ -364,6 +457,111 @@ def test_onboard_planner_prompt_contract():
     print("✓ test_onboard_planner_prompt_contract")
 
 
+async def _test_debug_gate_stage_filter():
+    with TemporaryDirectory() as tmp:
+        gate = DebugGate(
+            enabled=True,
+            root=Path(tmp),
+            session_id="test_session",
+            stages={"cloud_response"},
+            targets=None,
+            poll_interval=0.01,
+        )
+        command = await gate.checkpoint(
+            "vlm_response",
+            {"decision": "continue"},
+            actor_id="drone_1",
+            allow_regenerate=True,
+        )
+        assert command == "continue"
+        assert list(Path(tmp).rglob("*")) == []
+
+
+def test_debug_gate_stage_filter():
+    run(_test_debug_gate_stage_filter())
+    print("✓ test_debug_gate_stage_filter")
+
+
+async def _test_debug_gate_roundtrip():
+    with TemporaryDirectory() as tmp:
+        gate = DebugGate(
+            enabled=True,
+            root=Path(tmp),
+            session_id="test_session",
+            stages={"cloud_response"},
+            targets=None,
+            poll_interval=0.01,
+        )
+        wait_task = asyncio.create_task(
+            gate.checkpoint(
+                "cloud_response",
+                {"parsed_roles": {"drone_1": {"mission_role": "observer"}}},
+                actor_id="cloud",
+                allow_regenerate=True,
+                summary="Inspect response",
+            )
+        )
+        await asyncio.sleep(0.05)
+        pending = list_pending_steps(Path(tmp), session_id="test_session")
+        assert len(pending) == 1
+        meta = read_step_metadata(pending[0])
+        assert meta["stage"] == "cloud_response"
+        assert meta["actor_id"] == "cloud"
+        assert "regenerate" in meta["allowed_commands"]
+        (pending[0] / "command.txt").write_text("regenerate", encoding="utf-8")
+        command = await asyncio.wait_for(wait_task, timeout=1.0)
+        assert command == "regenerate"
+        assert (pending[0] / "resolved.json").exists()
+
+
+def test_debug_gate_roundtrip():
+    run(_test_debug_gate_roundtrip())
+    print("✓ test_debug_gate_roundtrip")
+
+
+async def _test_debug_gate_vlm_only_pauses_once_per_actor():
+    with TemporaryDirectory() as tmp:
+        gate = DebugGate(
+            enabled=True,
+            root=Path(tmp),
+            session_id="test_session",
+            stages={"vlm_request", "vlm_response"},
+            targets=None,
+            poll_interval=0.01,
+            vlm_pause_once_per_actor=True,
+        )
+        first_wait = asyncio.create_task(
+            gate.checkpoint(
+                "vlm_request",
+                {"tick": 1},
+                actor_id="drone_1",
+                allow_regenerate=True,
+            )
+        )
+        await asyncio.sleep(0.05)
+        pending = list_pending_steps(Path(tmp), session_id="test_session")
+        assert len(pending) == 1
+        (pending[0] / "command.txt").write_text("continue", encoding="utf-8")
+        first_command = await asyncio.wait_for(first_wait, timeout=1.0)
+        assert first_command == "continue"
+
+        second_command = await gate.checkpoint(
+            "vlm_request",
+            {"tick": 2},
+            actor_id="drone_1",
+            allow_regenerate=True,
+        )
+        assert second_command == "continue"
+
+        all_step_dirs = [path for path in (Path(tmp) / "test_session").iterdir() if path.is_dir() and not path.name.startswith(".")]
+        assert len(all_step_dirs) == 1, all_step_dirs
+
+
+def test_debug_gate_vlm_only_pauses_once_per_actor():
+    run(_test_debug_gate_vlm_only_pauses_once_per_actor())
+    print("✓ test_debug_gate_vlm_only_pauses_once_per_actor")
+
+
 # ─── GlobalOperator live test ─────────────────────────────────────────────────
 
 async def _test_global_operator():
@@ -417,8 +615,13 @@ if __name__ == "__main__":
         test_pool_event_stream,
         test_role_brief_legacy_mapping,
         test_agent_profile_derives_capabilities_from_primitives,
+        test_openai_client_proxy_bypass_detection,
         test_assign_roles_prompt_contract,
+        test_assign_roles_profile_validation_regenerates,
         test_onboard_planner_prompt_contract,
+        test_debug_gate_stage_filter,
+        test_debug_gate_roundtrip,
+        test_debug_gate_vlm_only_pauses_once_per_actor,
         test_global_operator,
     ]
     passed = failed = 0

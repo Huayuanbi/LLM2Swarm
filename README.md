@@ -2,7 +2,7 @@
 
 一个面向多智能体协同的云边协同框架原型。
 
-这个仓库现在的目标，不再是“云端直接把每架无人机的动作列表规划到底”，而是提供一套更通用的接口：
+这个仓库提供一套面向多智能体协同的统一接口：
 
 - 用户给出抽象任务，例如 `search the area for fire`
 - 云端只做角色分配，不直接给完整动作序列
@@ -10,11 +10,11 @@
 - 执行中再由 VLM / 本地模型根据图像、共享记忆、事件来修改任务图
 - runtime 负责验证、执行、共享状态、协调 claim / event
 
-当前这套框架被用于无人机 demo，但接口是按“通用多智能体”去设计的，后续可以接更强模型、agent framework、不同 agent 类型，甚至地面机器人。
+这套框架目前接入了无人机 demo，但接口按“通用多智能体”设计，后续可以接更强模型、agent framework、不同 agent 类型，甚至地面机器人。
 
-## 当前定位
+## 项目定位
 
-这个项目当前更像“群体智能运行框架 + Webots / mock 验证平台”，重点在：
+这个项目由“群体智能运行框架 + Webots / mock 验证平台”两部分组成，重点在：
 
 - 抽象任务输入
 - 云端角色分工
@@ -45,6 +45,18 @@ flowchart TD
     J --> I
 ```
 
+如果只看“任务如何从抽象意图变成可执行流程”，可以把这套框架理解成：
+
+```mermaid
+flowchart LR
+    A["Abstract mission"] --> B["Cloud RoleBrief"]
+    B --> C["Onboard TaskGraphSpec"]
+    C --> D["Runtime validation"]
+    D --> E["Primitive execution"]
+    E --> F["VLM / events / claims"]
+    F --> C
+```
+
 可以把它理解成 5 层：
 
 1. `Mission layer`
@@ -61,6 +73,83 @@ flowchart TD
 
 5. `Execution layer`
 具体 primitive 和控制器实现，例如 `mock` / `Webots`。
+
+## 任务图执行模型
+
+下面用一个具体例子说明：
+
+- 用户任务：`search the area for fire`
+- 云端把 `drone_1` 分到“东北角区域”
+- 机载 planner 需要为 `drone_1` 生成初始任务图
+
+### 任务图语义示例
+
+机载 planner 生成的任务图可以同时包含主路径和事件驱动分支。
+
+```mermaid
+graph TD
+    A["takeoff"] --> B["transit_to_northeast_sector"]
+    B --> C["search_northeast_sector"]
+    C -->|"on_event: target_detected"| D["confirm_or_hold"]
+    D --> E["publish_target_event"]
+    E --> F["wait_or_retask"]
+    F -->|"on_event: continue_search"| C
+    C -->|"on_event: battery_low"| G["return_or_land"]
+    C -->|"on_event: region_complete"| H["request_next_assignment"]
+```
+
+这类图的关键不是 `takeoff -> goto -> search` 本身，而是：
+
+- `target_detected` 时能跳到确认节点
+- `false_alarm / continue_search` 时能回到搜索节点
+- `battery_low` 时能走退出分支
+- `region_complete` 时能申请下一个任务
+
+### Runtime 执行方式
+
+仓库里的 `TaskGraphSpec` 接口已经支持 `nodes + edges + conditions`，runtime 会把它映射到可执行 primitive 流程。
+
+现在更接近下面这种执行方式：
+
+```mermaid
+graph TD
+    A["takeoff"] --> B["go_to_waypoint(ne_center)"]
+    B --> C["search_pattern(ne_center)"]
+    C -. "VLM modify / task_graph_patch" .-> D["prepend temporary action(s)"]
+    D -. "execute then resume" .-> C
+```
+
+执行语义可以概括为：
+
+- 初始图通常是一个比较短的 backbone
+- runtime 主要稳定支持 `on_success`
+- 图会先被线性化成 primitive queue
+- 动态变化目前主要靠 `VLMDecision.new_action` 或 `TaskGraphPatch`
+- 持续性行为更多由 `search_pattern` 这类 continuous primitive 承担
+
+### 已实现能力与扩展方向
+
+这套 runtime 已经具备：
+
+- `TaskGraphSpec` / `TaskGraphPatch` 作为统一接口
+- 机载模型生成图
+- runtime 校验图是否合法
+- VLM 在运行时插入 patch
+
+仍待继续增强的部分包括：
+
+- 真正的图状态机执行
+- 基于 `on_event` / `on_failure` 的原生图跳转
+- 图上的回边和分支条件求值
+- “当前节点指针 + 事件驱动迁移”的通用 graph engine
+
+从执行模型上看，它更接近：
+
+- `图接口 + 线性执行 + 运行时补丁`
+
+而不是：
+
+- `完整事件驱动图执行器`
 
 ## 核心数据契约
 
@@ -92,7 +181,7 @@ flowchart TD
 
 ### 2. `AgentProfile`
 
-当前 agent 的能力画像。
+agent 的能力画像。
 
 它描述的是：
 
@@ -359,18 +448,18 @@ build_agent_profile(...)
 - [controllers/mock_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/mock_controller.py)
 - [controllers/webots_controller.py](/Users/hyb/LocalProj/LLM2Swarm/controllers/webots_controller.py)
 
-当前 controller 负责：
+controller 负责：
 
 - 连接 simulator / backend
 - 读位置、速度、相机
 - 执行 primitive
 - 暴露自己的 `AgentProfile`
 
-现在 `execute_action()` 已经从 registry 读 primitive，而不是手写固定 dispatch。
+`execute_action()` 通过 registry 读取 primitive 定义并分发到具体 handler。
 
 ## 更新模型能力时，需要遵守什么接口
 
-这是后续把普通 `llm/vlm` 换成更强 agent framework 时最重要的部分。
+这是后续替换模型后端或接入 agent framework 时最重要的部分。
 
 ### 1. 升级云端角色规划模型
 
@@ -441,16 +530,7 @@ build_agent_profile(...)
 
 这样 `AgentProfile`、云端角色分配、机载 planner、VLM prompt 都会自动看到这项能力。
 
-4. 如果还在使用旧的 `plan_mission()` 兼容路径，再补 legacy schema
-
-也就是：
-
-- [models/schemas.py](/Users/hyb/LocalProj/LLM2Swarm/models/schemas.py) 里的老 `TaskAction`
-- [operators/global_operator.py](/Users/hyb/LocalProj/LLM2Swarm/operators/global_operator.py) 里的旧 action-list prompt
-
-但这条路径现在是兼容层，不是主路径。
-
-5. 补测试
+4. 补测试
 
 至少建议补：
 
@@ -458,19 +538,9 @@ build_agent_profile(...)
 - registry surface test
 - runtime 接受/拒绝能力约束测试
 
-### 现在这套方式为什么比以前更好
-
-因为现在新增动作时，不需要再同时手改：
-
-- controller dispatch 表
-- onboard planner 的 primitive 列表
-- VLM prompt 的 primitive 列表
-
-这些都已经改成从 registry 读取。
-
 ## 运行模式
 
-当前仓库支持三种运行形态：
+仓库支持三种运行形态：
 
 - `mock`
 - `Webots` 单机 demo
@@ -490,7 +560,7 @@ python main.py
 ./scripts/run_webots_single_demo.sh
 ```
 
-当前单机路径已经打通：
+单机路径已经打通：
 
 - `camera -> VLM -> action`
 - `RoleBrief -> OnboardPlanner -> TaskGraph`
@@ -521,9 +591,231 @@ python main.py
 - 得到初始 `TaskGraph`
 - 启动 `DroneLifecycle`
 
+## Debug Mode
+
+仓库支持一个“人工门控”的 debug mode。
+
+打开后，系统会在关键模型传输节点暂停，把 request / response 落到磁盘里，等待你人工决定：
+
+- `continue`
+- `regenerate`
+- `abort`
+
+这个模式是**文件门控**，不是 stdin 交互，所以：
+
+- 云端初始化阶段可以用
+- 单机 Webots 可以用
+- 多机 Webots 的多进程 controller 也可以用
+
+这正是它比“在子线程里直接等 input()”更稳的地方。
+
+### Debug Mode 插在整条链路里的位置
+
+```mermaid
+flowchart TD
+    A["Natural-language mission"] --> B["cloud_request"]
+    B --> C["GlobalOperator.assign_roles"]
+    C --> D["cloud_response"]
+    D --> E["Per-agent RoleBrief"]
+    E --> F["onboard_request"]
+    F --> G["OnboardPlannerAgent"]
+    G --> H["onboard_response"]
+    H --> I["TaskGraph runtime / DroneLifecycle"]
+    I --> J["vlm_request"]
+    J --> K["VLMAgent"]
+    K --> L["vlm_response"]
+    L --> M["apply decision / patch / event"]
+    M --> I
+```
+
+这张图里每个 `*_request / *_response` 都可以被 debug gate 暂停。
+
+默认只打开前四个：
+
+- `cloud_request`
+- `cloud_response`
+- `onboard_request`
+- `onboard_response`
+
+这样最适合检查：
+
+- mission 是否真的传给了 cloud planner
+- `RoleBrief` 是否合理
+- onboard request 是否真的吃到了 `RoleBrief + self_state + peer_states + agent_profile`
+- onboard response 是否生成了合法 `TaskGraph`
+
+### 支持的关键阶段
+
+- `cloud_request`
+- `cloud_response`
+- `onboard_request`
+- `onboard_response`
+- `vlm_request`
+- `vlm_response`
+
+默认只打开前四个，也就是：
+
+- 云端角色分配前后
+- 机载初始任务图生成前后
+
+这样比较适合先调前半段。
+
+如果你把 `vlm_request / vlm_response` 也打开了，默认行为是：
+
+- 每架无人机只在第一次 VLM request 暂停一次
+- 每架无人机只在第一次 VLM response 暂停一次
+
+也就是说，运行时不会因为每个 tick 都停下来而不可用。
+
+这个默认行为可以通过环境变量控制：
+
+```bash
+export LLM2SWARM_DEBUG_VLM_PAUSE_ONCE=1
+```
+
+默认就是开启状态。
+
+### 如何打开
+
+最简单的方式：
+
+```bash
+export LLM2SWARM_DEBUG=1
+./scripts/run_webots_swarm_demo.sh
+```
+
+或者单机：
+
+```bash
+export LLM2SWARM_DEBUG=1
+./scripts/run_webots_single_demo.sh
+```
+
+默认 debug stages 是：
+
+```bash
+cloud_request,cloud_response,onboard_request,onboard_response
+```
+
+如果你连运行时 VLM 也想停下来一起看，可以显式打开：
+
+```bash
+export LLM2SWARM_DEBUG_STAGES=cloud_request,cloud_response,onboard_request,onboard_response,vlm_request,vlm_response
+```
+
+`run_webots_single_demo.sh` 和 `run_webots_swarm_demo.sh` 在 debug mode 下会自动启动本地 debug UI，
+并在终端打印：
+
+- `panel url`
+- `panel log`
+
+在 macOS 上，默认还会自动帮你打开浏览器。
+
+默认地址是：
+
+```text
+http://127.0.0.1:8765
+```
+
+如果这个端口已经被占用，debug UI 会自动切换到下一个可用端口，并在终端打印实际 URL。
+
+如果你想改 host / port：
+
+```bash
+export LLM2SWARM_DEBUG_UI_HOST=127.0.0.1
+export LLM2SWARM_DEBUG_UI_PORT=8765
+```
+
+如果你不想自动打开浏览器：
+
+```bash
+export LLM2SWARM_DEBUG_UI_OPEN_BROWSER=0
+```
+
+如果你不想自动启动面板：
+
+```bash
+export LLM2SWARM_DEBUG_UI_AUTO_START=0
+```
+
+### 程序暂停后去哪里看
+
+默认目录：
+
+```bash
+/tmp/llm2swarm_debug
+```
+
+每次运行会写一个 session 目录，里面每个暂停点都会生成一个 step 目录，包含：
+
+- `payload.json`
+- `meta.json`
+- `instructions.txt`
+- `command.txt`（等待你写入命令）
+
+### 如何查看和放行
+
+先列出 pending 的暂停点：
+
+```bash
+conda run -n llm2swarm python scripts/debug_gate.py list
+```
+
+最方便的方式通常是直接看“最新那个”：
+
+```bash
+conda run -n llm2swarm python scripts/debug_gate.py show latest
+```
+
+然后对某个 step 回复命令：
+
+```bash
+conda run -n llm2swarm python scripts/debug_gate.py reply /tmp/llm2swarm_debug/<session>/<step> continue
+```
+
+也可以写：
+
+- `regenerate`
+- `abort`
+
+如果你不想一直在终端里找路径，也可以开一个本地网页面板：
+
+```bash
+conda run -n llm2swarm python scripts/debug_gate.py serve
+```
+
+如果你已经知道 session，也可以只看这一轮：
+
+```bash
+conda run -n llm2swarm python scripts/debug_gate.py serve --session <session_id>
+```
+
+### 这个模式适合什么
+
+比较适合：
+
+- 检查云端 role allocation prompt/输出
+- 检查机载 bootstrap task graph prompt/输出
+- 在真实多机联调时做人工门控
+
+不太适合默认长期打开运行时 VLM 全阶段，因为：
+
+- 每个 tick 都可能暂停
+- 多机时会产生很多 step 目录
+
+所以更推荐：
+
+- 前半段默认开
+- 后半段按需打开
+
+这里还有一层保护：
+
+- 即使打开 `vlm_request / vlm_response`
+- 默认也只暂停每架无人机的第一次 VLM tick
+
 ## Tunnel / Remote Ollama
 
-当前仓库里的云端角色规划、机载 planner、VLM demo，默认都不是直接连公网 API，
+仓库里的云端角色规划、机载 planner、VLM demo，默认都不是直接连公网 API，
 而是通过本机 SSH tunnel 转发到远端 Ollama 服务。
 
 也就是说，README 里这些地址：
@@ -588,7 +880,7 @@ curl --noproxy localhost -s http://localhost:11435/api/tags
 
 ### 和 `.env` 的关系
 
-当前常见配置是：
+常见配置是：
 
 ```env
 EDGE_VLM_BASE_URL=http://localhost:11435/v1
@@ -597,6 +889,10 @@ ONBOARD_PLANNER_BASE_URL=http://localhost:11435/v1
 ```
 
 这些值只有在 tunnel 正常建立时才有意义。
+当这些 `*_BASE_URL` 指向 `localhost` 或私网地址时，仓库里的
+OpenAI-compatible 客户端现在会默认绕过系统 HTTP 代理环境变量，
+避免在 Clash / 代理开启时出现 Python SDK 直接报 `Connection error`
+但 `curl --noproxy localhost` 正常的情况。
 
 如果后续你改成：
 
@@ -618,9 +914,13 @@ EDGE_VLM_BASE_URL=http://localhost:11435/v1
 
 GLOBAL_LLM_BASE_URL=http://localhost:11435/v1
 GLOBAL_LLM_MODEL=qwen3.5:4b
+GLOBAL_LLM_TIMEOUT=180
+GLOBAL_LLM_MAX_RETRIES=3
+GLOBAL_LLM_RETRY_BASE_DELAY=2
 
 ONBOARD_PLANNER_BASE_URL=http://localhost:11435/v1
 ONBOARD_PLANNER_MODEL=qwen3.5:4b
+ONBOARD_PLANNER_TIMEOUT=90
 ```
 
 Webots 多机初始化额外支持：
@@ -648,7 +948,7 @@ python tests/test_phase2.py
 python tests/test_phase3.py
 ```
 
-当前测试覆盖：
+测试覆盖：
 
 - `Phase 1`
   - controller 基础能力
@@ -671,7 +971,7 @@ python tests/test_phase3.py
 
 这些测试更偏“框架 contract / runtime 回归”，不是对真实模型效果的最终评估。
 
-## 当前仍然存在的限制
+## 已知限制
 
 - Webots demo 目前仍然只实现了一小组 primitive
 - `TaskGraph` runtime 还偏线性执行，不是完整的通用 graph engine
@@ -686,8 +986,8 @@ python tests/test_phase3.py
 
 ## 一句话总结
 
-这个仓库现在的核心不是“让云端替每架无人机把动作写死”，而是提供一套可扩展接口：
+这个仓库的核心是一套可扩展接口：
 
 `抽象任务 -> 云端角色分配 -> 机载任务图生成 -> 运行时视觉/事件重规划 -> primitive 执行`
 
-后续无论你换更强模型、换 agent framework、加新 agent 类型、加新 primitive，优先都应该沿着这套 contract 扩展，而不是回到写死某个场景逻辑。
+后续无论你换更强模型、换 agent framework、加新 agent 类型、加新 primitive，都可以沿着这套 contract 扩展。
